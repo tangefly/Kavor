@@ -27,13 +27,19 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        
+        # Compatible with multimodal models
+        if hasattr(hf_config, "text_config"):
+            torch.set_default_dtype(hf_config.text_config.dtype)
+        else:
+            torch.set_default_dtype(hf_config.dtype)
+        
         torch.set_default_device("cuda")
         self.model = AutoModelForCausalLM.from_pretrained(hf_config)
         # self.model = Qwen3ForCausalLM(hf_config)
         # load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.warmup_model()
+        # self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -197,7 +203,8 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            logits = self.model(input_ids, positions)
+            return self.model.compute_logits(logits)
         else:
             bs = input_ids.size(0)
             context = get_context()

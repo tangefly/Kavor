@@ -97,6 +97,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
     def __init__(
         self,
+        output_size: int,
         hidden_size: int,
         head_size: int,
         total_num_heads: int,
@@ -108,7 +109,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
         self.num_kv_heads = divide(total_num_kv_heads, tp_size)
-        output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):

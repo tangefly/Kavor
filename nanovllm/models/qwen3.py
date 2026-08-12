@@ -38,8 +38,11 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
+        
+        output_size = (self.total_num_heads + 2 * self.total_num_kv_heads) * self.head_dim
 
         self.qkv_proj = QKVParallelLinear(
+            output_size,
             hidden_size,
             self.head_dim,
             self.total_num_heads,

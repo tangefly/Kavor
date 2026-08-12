@@ -4,7 +4,9 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/home/tanger/workspace/models/Qwen3-0.6B")
+    # path = os.path.expanduser("/home/tanger/workspace/models/Qwen3-0.6B")
+    path = os.path.expanduser("/home/tanger/workspace/models/Mistral-7B-Instruct-v0.2")
+    # path = os.path.expanduser("/home/tanger/workspace/models/Qwen3.5-4B")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
