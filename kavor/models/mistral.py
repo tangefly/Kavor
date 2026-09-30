@@ -21,8 +21,8 @@ from transformers.utils.generic import maybe_autocast, merge_with_config_default
 from transformers.utils.output_capturing import capture_outputs
 from transformers import MistralConfig
 
-from nanovllm.layers.attention import Attention
-from nanovllm.layers.embed_head import ParallelLMHead
+from kavor.layers.attention import Attention
+from kavor.layers.embed_head import ParallelLMHead
 
 class MistralMLP(nn.Module):
     def __init__(self, config):

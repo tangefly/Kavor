@@ -1,4 +1,4 @@
-# Nano-vLLM
+# Kavor
 
 A lightweight vLLM implementation built from scratch.
 
@@ -11,7 +11,7 @@ A lightweight vLLM implementation built from scratch.
 ## Installation
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+pip install git+https://github.com/tangefly/Kavor.git
 ```
 
 ## Model Download
@@ -27,10 +27,10 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 
 See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
-from nanovllm import LLM, SamplingParams
+from kavor import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
+prompts = ["Hello, Kavor."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
@@ -50,4 +50,4 @@ See `bench.py` for benchmark.
 | Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
 |----------------|-------------|----------|-----------------------|
 | vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
+| Kavor          | 133,966     | 93.41    | 1434.13               |

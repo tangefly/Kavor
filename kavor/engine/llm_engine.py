@@ -5,11 +5,11 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
-from nanovllm.config import Config
-from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
+from kavor.config import Config
+from kavor.sampling_params import SamplingParams
+from kavor.engine.sequence import Sequence
+from kavor.engine.scheduler import Scheduler
+from kavor.engine.model_runner import ModelRunner
 
 
 class LLMEngine:

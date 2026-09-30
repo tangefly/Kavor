@@ -15,6 +15,6 @@ class _LazyTypeMapping(OrderedDict):
     def __getitem__(self, key: str):
         if key not in self._modules:
             class_name = self._mapping[key]
-            module = importlib.import_module(f".{key}", "nanovllm.models")
+            module = importlib.import_module(f".{key}", "kavor.models")
             self._modules[key] = getattr(module, class_name)
         return self._modules[key]

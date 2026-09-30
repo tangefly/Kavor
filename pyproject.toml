@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
+name = "kavor"
 version = "0.2.0"
 authors = [{ name = "Xingkai Yu" }]
 license = "MIT"
@@ -20,8 +20,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/tangefly/Kavor"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nanovllm*"]
+include = ["kavor*"]
