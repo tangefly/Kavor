@@ -1,5 +1,7 @@
 # Kavor
 
+**English** | [简体中文](README_zh.md)
+
 A lightweight vLLM implementation built from scratch.
 
 ## Key Features
