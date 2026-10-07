@@ -22,6 +22,12 @@ dependencies = [
 [project.urls]
 Homepage="https://github.com/tangefly/Kavor"
 
+[project.optional-dependencies]
+serve = ["fastapi", "uvicorn"]
+
+[project.scripts]
+kavor = "kavor.entrypoints.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["kavor*"]

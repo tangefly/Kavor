@@ -6,10 +6,8 @@ from multiprocessing.shared_memory import SharedMemory
 
 from kavor.config import Config
 from kavor.engine.sequence import Sequence
-from kavor.models.qwen3 import Qwen3ForCausalLM
 from kavor.layers.sampler import Sampler
 from kavor.utils.context import set_context, get_context, reset_context
-from kavor.utils.loader import load_model
 from kavor.models import AutoModelForCausalLM
 
 
@@ -36,8 +34,6 @@ class ModelRunner:
         
         torch.set_default_device("cuda")
         self.model = AutoModelForCausalLM.from_pretrained(hf_config)
-        # self.model = Qwen3ForCausalLM(hf_config)
-        # load_model(self.model, config.model)
         self.sampler = Sampler()
         # self.warmup_model()
         self.allocate_kv_cache()
