@@ -7,11 +7,14 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+import time
 
 from kavor.engine.async_engine import AsyncEngine
 from kavor.entrypoints.cli import add_server_args
 from kavor.sampling_params import SamplingParams
+
+from .request import *
+from .response import *
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -19,26 +22,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_server_args(parser)  # 参数定义统一放在 cli.py,kavor serve 子命令复用
     return parser.parse_args(argv)
 
-class GenerateRequest(BaseModel):
-    prompt: str
-    max_tokens: int = 512  # 引擎默认只有 64,服务端必须显式给默认值
-    temperature: float = 1.0
-    ignore_eos: bool = False
-    stream: bool = False
-    request_id: str | None = None
-
-
 def to_sampling_params(req: GenerateRequest) -> SamplingParams:
     # OpenAI 习惯 temperature=0 表示 greedy,但 SamplingParams 禁止 <= 1e-10,映射成 epsilon
     temperature = req.temperature if req.temperature > 1e-10 else 1e-6
     return SamplingParams(
         temperature=temperature,
-        max_tokens=req.max_tokens,
-        ignore_eos=req.ignore_eos,
+        max_tokens=req.max_tokens
     )
 
 async def consume_all(queue: asyncio.Queue) -> tuple[list[int], str]:
-    """非流式:消费队列直到哨兵,返回 (completion token ids, finish_reason)。"""
     token_ids: list[int] = []
     finish_reason = "stop"
     while True:
@@ -53,11 +45,6 @@ async def consume_all(queue: asyncio.Queue) -> tuple[list[int], str]:
 
 
 async def stream_sse(queue: asyncio.Queue, tokenizer):
-    """流式:把队列消息转成 SSE。
-
-    detokenize 用"全量 decode + 文本 diff":直接 decode 单个 token 会把
-    多 byte UTF-8 字符(如中文)切碎,必须先攒全量再切增量。
-    """
     sent_text = ""
     token_ids: list[int] = []
     while True:
@@ -79,9 +66,9 @@ async def stream_sse(queue: asyncio.Queue, tokenizer):
 def build_app(args: argparse.Namespace) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # 引擎只能在 lifespan 里创建:--reload / 多 worker 会把引擎复制多份
         engine = AsyncEngine(
             args.model,
+            model_name=args.model_name,
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len,
             max_num_seqs=args.max_num_seqs,
@@ -92,13 +79,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
         app.state.engine = engine
         app.state.args = args
         yield
-        engine.exit()  # 停引擎线程 + join TP 子进程
+        engine.exit()
 
     app = FastAPI(lifespan=lifespan)
 
     @app.get("/health")
     async def health():
-        # 引擎线程挂了要暴露出来,方便探针
         if app.state.engine.is_alive():
             return {"status": "ok"}
         return JSONResponse(status_code=503, content={"status": "engine thread dead"})
@@ -136,16 +122,56 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             "num_completion_tokens": len(token_ids),
             "finish_reason": finish_reason,
         }
+        
+    @app.post("/v1/chat/completions")
+    async def chat_completions(req: ChatCompletionRequest):
+        if req.model is not app.state.engine.model_name:
+            pass
+        
+        request_id = uuid.uuid4().hex
+        
+        messages = []
+        for item in req.messages:
+            messages.append({"role": item.role, "content": item.content})
+        
+        prompt = app.state.engine.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        
+        queue = await app.state.engine.add_request(
+            request_id, prompt, to_sampling_params(req))
+
+        token_ids, finish_reason = await consume_all(queue)
+        
+        response = ChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4().hex}",
+            created=int(time.time()),
+            model=req.model,
+            choices=[
+                Choice(
+                    index=0,
+                    message=ChatCompletionMessage(
+                        content=app.state.engine.tokenizer.decode(token_ids, skip_special_tokens=True)
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=0,
+                completion_tokens=len(token_ids),
+                total_tokens=0,
+            ),
+        )
+        
+        return response
 
     return app
 
-
 def run(args: argparse.Namespace):
-    """供 cli.py 的 serve 子命令调用。"""
     app = build_app(args)
-    # 只能单 worker、不能开 reload,否则引擎会被复制多份(真实引擎含 TP 子进程)
     uvicorn.run(app, host=args.host, port=args.port)
-
 
 def main(argv: list[str] | None = None):
     run(parse_args(argv))

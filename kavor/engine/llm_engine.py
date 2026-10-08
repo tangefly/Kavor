@@ -15,20 +15,11 @@ from kavor.engine.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
-WORKER_EXIT_TIMEOUT = 10.0   # 等 TP 子进程优雅退出的上限(秒)
-WORKER_KILL_TIMEOUT = 5.0    # SIGTERM 之后再等这么久,然后 SIGKILL
+WORKER_EXIT_TIMEOUT = 10.0
+WORKER_KILL_TIMEOUT = 5.0
 
 
 def _worker_entry(config: Config, rank: int, event):
-    """TP 子进程入口(rank > 0)。
-
-    Ctrl-C 不是只发给父进程 —— 终端会把 SIGINT 发给**整个前台进程组**,TP 子进程
-    也在里面。如果子进程跟着一起死,父进程 ModelRunner.exit() 里的 dist.barrier()
-    就永远等不到对端:进程挂死、显存不释放、只能 kill -9。
-
-    所以子进程忽略 SIGINT,退出统一由父进程编排(父进程发退出信号 → 子进程跳出
-    loop() 走完 barrier → 父进程 join)。
-    """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     ModelRunner(config, rank, event)
 
@@ -47,12 +38,10 @@ class LLMEngine:
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
             process = ctx.Process(target=_worker_entry, args=(config, i, event))
-            process.daemon = True   # 父进程意外退出时由解释器兜底终止,不留孤儿进程
+            process.daemon = True
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        # 必须注册在最慢的模型加载之前:加载途中被 Ctrl-C 打断时,
-        # 上面已经起好的 TP 子进程需要有人收尸
         atexit.register(self.exit)
         try:
             self.model_runner = ModelRunner(config, 0, self.events)
@@ -60,29 +49,22 @@ class LLMEngine:
             config.eos = self.tokenizer.eos_token_id
             self.scheduler = Scheduler(config)
         except BaseException:
-            # 加载失败 / 被 Ctrl-C 打断:别把 TP 子进程留成孤儿
             self.exit()
             raise
 
     def exit(self):
-        """停引擎并回收所有 TP 子进程。幂等,任何线程、任何阶段调用都安全。"""
         if self._exiting:
             return
         self._exiting = True
-        # 只要有一个子进程已经死了,就不能走优雅路径:ModelRunner.exit() 里的
-        # dist.barrier() 会永远等不到对端,把整个进程挂死在 teardown 里
         workers_alive = all(p.is_alive() for p in self.ps)
         if getattr(self, "model_runner", None) is not None and workers_alive:
-            self.model_runner.call("exit")   # 通知各 rank 跳出 loop()
+            self.model_runner.call("exit")
             del self.model_runner
             self._reap_workers(graceful=True)
         else:
-            # 要么 rank 0 自己都没构造完(子进程在等一个永远不来的信号),
-            # 要么已经有人先死了 —— 都只能强杀
             self._reap_workers(graceful=False)
 
     def _reap_workers(self, graceful: bool):
-        """回收 TP 子进程:等 → SIGTERM → SIGKILL,三级兜底,不挂死也不留孤儿。"""
         if graceful:
             deadline = monotonic() + WORKER_EXIT_TIMEOUT
             for p in self.ps:
@@ -101,7 +83,6 @@ class LLMEngine:
                 p.join(timeout=2.0)
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> int:
-        """提交请求,返回 seq_id(服务化需要它来关联输出队列)。"""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
