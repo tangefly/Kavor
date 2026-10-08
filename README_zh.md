@@ -27,6 +27,8 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 
 ## 快速上手
 
+- API 代码调用
+
 用法参见 `example.py`。API 与 vLLM 接口保持一致，仅在 `LLM.generate` 方法上略有差异：
 ```python
 from kavor import LLM, SamplingParams
@@ -36,6 +38,23 @@ prompts = ["Hello, Kavor."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
+
+- HTTP 调用
+
+```
+CUDA_VISIBLE_DEVICES=0,1 kavor serve Mistral-7B-Instruct-v0.2 \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 8192 \
+  --port 25541
+```
+
+## 支持的模型
+
+| 家族 | Hugging Face | ModelScope |
+|----------------|-------------|-------------|
+| Qwen3           | [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)     |      [Qwen3-0.6B](https://www.modelscope.cn/models/Qwen/Qwen3-0.6B)      |
+| Mistral         | [Mistral-7B-Instruct-v0.2](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2)     |      [Mistral-7B-Instruct-v0.2](https://www.modelscope.cn/models/AI-ModelScope/Mistral-7B-Instruct-v0.2/summary)      |
 
 ## 性能测试
 
