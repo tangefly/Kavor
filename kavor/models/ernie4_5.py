@@ -79,12 +79,14 @@ class Ernie4_5Attention(nn.Module):
             bias=False,
         )
         
-        rope_theta = getattr(config, "rope_theta", 1000000)
+        rope_parameters = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+        rope_theta = rope_parameters.get("rope_theta", getattr(config, "rope_theta", 1000000))
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=config.max_position_embeddings,
             base=rope_theta,
+            interleaved=True,
         )
         
         self.attn = Attention(
