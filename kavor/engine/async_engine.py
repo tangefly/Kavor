@@ -162,6 +162,7 @@ class AsyncEngine:
             new = token_ids[seen:]
             if new:
                 self._push(state.queue, ("delta", new))
+            print(f"max_tokens: {state.max_tokens}")
             reason = "length" if len(token_ids) >= state.max_tokens else "stop"
             self._push(state.queue, ("finish", reason))
             self._push(state.queue, None)

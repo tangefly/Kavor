@@ -12,6 +12,7 @@ def add_server_args(parser: argparse.ArgumentParser):
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--enforce-eager", action="store_false")
+    parser.add_argument("--temperature", type=float, default=0.2)
     
 
 def main(argv: list[str] | None = None):
@@ -24,7 +25,7 @@ def main(argv: list[str] | None = None):
     args = parser.parse_args(argv)
     if args.command == "serve":
         try:
-            from kavor.entrypoints.openai import api_server
+            from kavor.interface.openai import api_server
         except ImportError as e:
             raise SystemExit(
                 "serve 需要 fastapi/uvicorn,请执行: pip install kavor[serve]") from e

@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, ConfigDict
 
 class GenerateRequest(BaseModel):
     prompt: str
-    max_tokens: int = 512  # 引擎默认只有 64,服务端必须显式给默认值
+    max_tokens: int = 512
     temperature: float = 1.0
     ignore_eos: bool = False
     stream: bool = False
