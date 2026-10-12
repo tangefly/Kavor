@@ -18,6 +18,7 @@ _COLORS = {
     logging.CRITICAL: "\033[1;31m", # blod red
 }
 _RESET = "\033[0m"
+_GRAY = "\033[90m"
 
 
 class _ColorFormatter(logging.Formatter):
@@ -26,18 +27,24 @@ class _ColorFormatter(logging.Formatter):
         super().__init__(fmt, datefmt)
         self._use_color = use_color
 
-    def format(self, record: logging.LogRecord) -> str:
-        if not self._use_color:
-            return super().format(record)
+    def formatTime(self, record, datefmt=None):
+        # asctime 由基类 format() 内部生成，只能在 formatTime 里染色
+        ts = super().formatTime(record, datefmt)
+        return f"{_GRAY}{ts}{_RESET}" if self._use_color else ts
 
+    def format(self, record):
         record = copy.copy(record)
-        color = _COLORS.get(record.levelno, "")
-        levelname = f"{record.levelname}:"
-        padded = f"{levelname:<9}"
-        record.levelname = (
-            f"{color}{record.levelname}{_RESET}"
-            f"{padded[len(record.levelname):]}"
-        )
+
+        # location
+        loc = f"[{record.filename}:{record.lineno}]"
+        record.location = f"{_GRAY}{loc}{_RESET}" if self._use_color else loc
+
+        if self._use_color:
+            # level
+            color = _COLORS.get(record.levelno, "")
+            record.levelname = (
+                f"{color}{record.levelname:<5}{_RESET}"
+            )
 
         return super().format(record)
 
@@ -71,7 +78,7 @@ def setup_logging(level: int | str | None = None, *, rank: int | None = None) ->
         own = [handler]
 
     prefix = f"[rank {rank}] " if rank is not None else ""
-    fmt = f"%(levelname)s %(asctime)s {prefix}[%(filename)s:%(lineno)d] %(message)s"
+    fmt = f"%(levelname)s %(asctime)s {prefix}%(location)s %(message)s"
     use_color = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
     own[0].setFormatter(_ColorFormatter(fmt, _DATE_FORMAT, use_color=use_color))
 
