@@ -18,11 +18,12 @@ class AutoModelForCausalLM:
     def from_pretrained(
         cls: type["AutoModelForCausalLM"],
         hfconfig,
+        use_tqdm,
         **kwargs,
     ):
         model_class = cls._get_model_class(hfconfig)
         model = model_class(hfconfig)
-        cls.load_weight(model, hfconfig.name_or_path)
+        cls.load_weight(model, hfconfig.name_or_path, use_tqdm)
         return model
 
     @classmethod
@@ -91,7 +92,8 @@ class AutoModelForCausalLM:
     def load_weight(
         cls: type["AutoModelForCausalLM"],
         model: nn.Module,
-        path: str
+        path: str,
+        use_tqdm: bool,
     ):
         packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
 
@@ -108,8 +110,12 @@ class AutoModelForCausalLM:
                 f"确认 --model 指向的是完整的 HF 模型目录")
 
         loaded: set[str] = set()
-        for file in tqdm(files, desc="Loading weights"):
-            loaded |= load_file(model, file, packed_modules_mapping)
+        if use_tqdm:
+            for file in tqdm(files, desc="Loading weights"):
+                loaded |= load_file(model, file, packed_modules_mapping)
+        else:
+            for file in files:
+                loaded |= load_file(model, file, packed_modules_mapping)
         cls._check_all_loaded(model, loaded)
 
     @classmethod

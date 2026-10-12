@@ -110,7 +110,7 @@ class AsyncEngine:
                     continue
                 
                 outputs, _ = self.engine.step()
-
+                
                 self._dispatch_running()
                 self._dispatch_finished(outputs)
         except BaseException as e:
@@ -154,7 +154,7 @@ class AsyncEngine:
                 self._push(state.queue, ("delta", new))
 
     def _dispatch_finished(self, outputs: list[tuple[int, list[int]]]):
-        for seq_id, token_ids in outputs:
+        for seq_id, token_ids, first_token_time, finish_time in outputs:
             state = self.tracker.pop(seq_id, None)
             seen = self._cursors.pop(seq_id, 0)
             if state is None:
@@ -166,6 +166,11 @@ class AsyncEngine:
             reason = "length" if len(token_ids) >= state.max_tokens else "stop"
             self._push(state.queue, ("finish", reason))
             self._push(state.queue, None)
+            elapsed = round(perf_counter() - state.arrival_time, 2)
+            ttft = round(first_token_time - state.arrival_time, 2)
+            tpot = round((len(token_ids) - 1) / (finish_time - first_token_time), 2)
+            logger.info(f"output tokens: {len(token_ids)}, elapsed: {elapsed} s, TTFT: {ttft} s, TPOT: {tpot} tokens/s")
+            
 
     def _fail_all_requests(self):
         for state in self.tracker.values():

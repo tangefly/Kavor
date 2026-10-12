@@ -12,6 +12,7 @@ from kavor.sampling_params import SamplingParams
 from kavor.engine.sequence import Sequence
 from kavor.engine.scheduler import Scheduler
 from kavor.engine.model_runner import ModelRunner
+from kavor.utils.logger import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ WORKER_KILL_TIMEOUT = 5.0
 
 
 def _worker_entry(config: Config, rank: int, event):
+    setup_logging(rank=rank)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     ModelRunner(config, rank, event)
 
@@ -51,6 +53,10 @@ class LLMEngine:
         except BaseException:
             self.exit()
             raise
+        logger.info(
+            "模型加载完成: %s | tensor_parallel_size=%d | max_model_len=%d | enforce_eager=%s",
+            config.model, config.tensor_parallel_size, config.max_model_len, config.enforce_eager,
+        )
 
     def exit(self):
         if self._exiting:
@@ -93,8 +99,15 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if is_prefill:
+            for seq in seqs:
+                seq.first_token_time = perf_counter()
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        for seq in seqs:
+            if seq.is_finished:
+                seq.finish_time = perf_counter()
+        outputs = [(seq.seq_id, seq.completion_token_ids, seq.first_token_time, seq.finish_time) for seq in seqs if seq.is_finished]
+        
         return outputs, num_tokens
 
     def is_finished(self):
@@ -124,7 +137,7 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
+            for seq_id, token_ids, _, _ in output:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()

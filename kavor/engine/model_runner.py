@@ -8,6 +8,7 @@ from kavor.config import Config
 from kavor.engine.sequence import Sequence
 from kavor.layers.sampler import Sampler
 from kavor.utils.context import set_context, get_context, reset_context
+from kavor.utils.logger import logger
 from kavor.models import AutoModelForCausalLM
 
 
@@ -33,7 +34,7 @@ class ModelRunner:
             torch.set_default_dtype(hf_config.dtype)
         
         torch.set_default_device("cuda")
-        self.model = AutoModelForCausalLM.from_pretrained(hf_config)
+        self.model = AutoModelForCausalLM.from_pretrained(hf_config, use_tqdm=(self.rank==0))
         self.sampler = Sampler()
         # self.warmup_model()
         self.allocate_kv_cache()
@@ -44,6 +45,13 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
+                try:
+                    self.shm = SharedMemory(name="kavor")
+                    self.shm.close()
+                    self.shm.unlink()
+                    logger.warning("Removed stale shared memory.")
+                except FileNotFoundError:
+                    pass
                 self.shm = SharedMemory(name="kavor", create=True, size=2**20)
                 dist.barrier()
             else:
@@ -116,6 +124,11 @@ class ModelRunner:
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        logger.info(
+            "KV cache: %d blocks (每块 %d tokens), 共 %.2f GB, 每 token 约 %.1f KB",
+            config.num_kvcache_blocks, self.block_size,
+            config.num_kvcache_blocks * block_bytes / 2**30, block_bytes / self.block_size / 1024,
+        )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():

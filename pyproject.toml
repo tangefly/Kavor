@@ -26,7 +26,7 @@ Homepage="https://github.com/tangefly/Kavor"
 serve = ["fastapi", "uvicorn"]
 
 [project.scripts]
-kavor = "kavor.entrypoints.cli:main"
+kavor = "kavor.interface.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

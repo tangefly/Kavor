@@ -17,12 +17,8 @@ class ToolCall(BaseModel):
 class ChatCompletionMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
     content: str | None = None
-
-    # Tool Calling
     tool_calls: list[ToolCall] | None = None
-
-    # vLLM / Qwen 扩展字段
-    reasoning_content: str | None = None
+    reasoning: str | None = None
 
 
 class Choice(BaseModel):

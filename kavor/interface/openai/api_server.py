@@ -68,18 +68,9 @@ async def stream_sse(queue: asyncio.Queue, tokenizer):
         elif kind == "finish":
             yield f"data: {json.dumps({'finish_reason': payload}, ensure_ascii=False)}\n\n"
 
-def build_app(args: argparse.Namespace) -> FastAPI:
+def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        engine = AsyncEngine(
-            args.model,
-            model_name=args.model_name,
-            tensor_parallel_size=args.tensor_parallel_size,
-            max_model_len=args.max_model_len,
-            max_num_seqs=args.max_num_seqs,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            enforce_eager=args.enforce_eager,
-        )
         engine.loop = asyncio.get_running_loop()
         app.state.engine = engine
         app.state.args = args
@@ -166,7 +157,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     message=ChatCompletionMessage(
                         content=app.state.paser.extract_content(raw_content),
                         tool_calls=app.state.paser.parse_tool_calls(raw_content),
-                        reasoning_content=app.state.paser.parse_thinking(raw_content)
+                        reasoning=app.state.paser.parse_thinking(raw_content)
                     ),
                     finish_reason=finish_reason,
                 )
@@ -183,7 +174,16 @@ def build_app(args: argparse.Namespace) -> FastAPI:
     return app
 
 def run(args: argparse.Namespace):
-    app = build_app(args)
+    engine = AsyncEngine(
+        args.model,
+        model_name=args.model_name,
+        tensor_parallel_size=args.tensor_parallel_size,
+        max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=args.enforce_eager,
+    )
+    app = build_app(args, engine)
     uvicorn.run(app, host=args.host, port=args.port)
 
 def main(argv: list[str] | None = None):
