@@ -182,6 +182,7 @@ def run(args: argparse.Namespace):
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
+        trust_remote_code=args.trust_remote_code,
     )
     app = build_app(args, engine)
     uvicorn.run(app, host=args.host, port=args.port)

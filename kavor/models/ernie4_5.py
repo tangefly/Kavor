@@ -1,5 +1,3 @@
-from collections.abc import Callable
-
 import torch
 from torch import nn
 
@@ -100,7 +98,7 @@ class Ernie4_5Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)

@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
-from transformers import AutoConfig
+
+from kavor.models.configuration_auto import AutoConfig
 
 
 @dataclass(slots=True)
@@ -12,6 +13,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    trust_remote_code: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -22,9 +24,9 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        
+
         # Compatible with multimodal models
-        if hasattr(self.hf_config, "text_config"):
+        if getattr(self.hf_config, "text_config", None) is not None:
             self.hf_config = self.hf_config.text_config
         max_position_embeddings = self.hf_config.max_position_embeddings
         self.max_model_len = min(self.max_model_len, max_position_embeddings)
