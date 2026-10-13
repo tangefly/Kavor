@@ -23,16 +23,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_server_args(parser)  # 参数定义统一放在 cli.py,kavor serve 子命令复用
     return parser.parse_args(argv)
 
-def to_sampling_params(req: ChatCompletionRequest, args: argparse.Namespace) -> SamplingParams:
+def to_sampling_params(req: ChatCompletionRequest | GenerateRequest, args: argparse.Namespace) -> SamplingParams:
+    max_tokens = req.max_tokens or getattr(req, "max_completion_tokens", None) or args.max_model_len
+    temperature = args.temperature if req.temperature is None else req.temperature
     # OpenAI 习惯 temperature=0 表示 greedy,但 SamplingParams 禁止 <= 1e-10,映射成 epsilon
-    if args.temperature:
-        req.temperature = args.temperature
-    if args.max_model_len:
-        req.max_tokens = args.max_model_len
-    temperature = req.temperature if req.temperature > 1e-10 else 1e-6
+    temperature = temperature if temperature > 1e-10 else 1e-6
     return SamplingParams(
         temperature=temperature,
-        max_tokens=req.max_tokens
+        max_tokens=min(max_tokens, args.max_model_len),
+        ignore_eos=getattr(req, "ignore_eos", False),
     )
 
 async def consume_all(queue: asyncio.Queue) -> tuple[list[int], str]:
@@ -74,7 +73,7 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
         engine.loop = asyncio.get_running_loop()
         app.state.engine = engine
         app.state.args = args
-        app.state.paser = get_paser(args.model)
+        app.state.paser = get_paser(args.model, engine.tokenizer)
         yield
         engine.exit()
 
@@ -98,7 +97,7 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
         }
 
     @app.post("/generate")
-    async def generate(req: ChatCompletionRequest):
+    async def generate(req: GenerateRequest):
         if not req.prompt:
             raise HTTPException(status_code=400, detail="prompt 不能为空")
         request_id = req.request_id or uuid.uuid4().hex
@@ -134,19 +133,25 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
                 msg["tool_calls"] = item.tool_calls
             messages.append(msg)
         
+        template_kwargs = {
+            **(getattr(app.state.args, "default_chat_template_kwargs", None) or {}),
+            **(req.chat_template_kwargs or {}),
+        }
         prompt = app.state.engine.tokenizer.apply_chat_template(
             messages,
             tools=req.tools,
             tokenize=False,
             add_generation_prompt=True,
+            **template_kwargs,
         )
-        
+
         queue = await app.state.engine.add_request(
             request_id, prompt, to_sampling_params(req, app.state.args))
 
         token_ids, finish_reason = await consume_all(queue)
-        raw_content = app.state.engine.tokenizer.decode(token_ids, skip_special_tokens=True)
-        
+        parsed = app.state.paser.parse(
+            app.state.engine.tokenizer.decode(token_ids), prompt)
+
         response = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex}",
             created=int(time.time()),
@@ -155,9 +160,9 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
                 Choice(
                     index=0,
                     message=ChatCompletionMessage(
-                        content=app.state.paser.extract_content(raw_content),
-                        tool_calls=app.state.paser.parse_tool_calls(raw_content),
-                        reasoning=app.state.paser.parse_thinking(raw_content)
+                        content=parsed.content,
+                        tool_calls=parsed.tool_calls,
+                        reasoning=parsed.reasoning,
                     ),
                     finish_reason=finish_reason,
                 )

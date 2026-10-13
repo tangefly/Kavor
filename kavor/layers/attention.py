@@ -48,17 +48,20 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        num_kv_slots: int = 1,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        self.k_cache = self.v_cache = torch.tensor([])
+        self.num_kv_slots = num_kv_slots
+        self.k_cache = [torch.tensor([]) for _ in range(num_kv_slots)]
+        self.v_cache = [torch.tensor([]) for _ in range(num_kv_slots)]
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, slot: int = 0):
         context = get_context()
-        k_cache, v_cache = self.k_cache, self.v_cache
+        k_cache, v_cache = self.k_cache[slot], self.v_cache[slot]
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:

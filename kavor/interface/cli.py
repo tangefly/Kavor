@@ -1,4 +1,5 @@
 import argparse
+import json
 
 
 def add_server_args(parser: argparse.ArgumentParser):
@@ -16,6 +17,10 @@ def add_server_args(parser: argparse.ArgumentParser):
         "--trust-remote-code", action="store_true",
         help="允许加载 tokenizer 时执行模型目录里的自定义代码。模型 config 由 Kavor 自己解析,不受此开关影响")
     parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument(
+        "--default-chat-template-kwargs", type=json.loads, default=None,
+        help='模板的默认变量(JSON),比如 \'{"enable_thinking": true}\'。'
+             '请求里的 chat_template_kwargs 优先级更高')
     
 
 def main(argv: list[str] | None = None):

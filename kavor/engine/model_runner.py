@@ -122,7 +122,11 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        # 一个 Attention 模块可能占多个 KV cache slot(Ouro 的每个循环步各占一份),
+        # 缓存层数按模块实际占用算,普通模型就是 num_hidden_layers
+        num_cache_layers = sum(
+            module.num_kv_slots for module in self.model.modules() if hasattr(module, "k_cache"))
+        block_bytes = 2 * num_cache_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         if self.enable_log:
@@ -131,13 +135,14 @@ class ModelRunner:
                 config.num_kvcache_blocks, self.block_size,
                 config.num_kvcache_blocks * block_bytes / 2**30, block_bytes / self.block_size / 1024,
             )
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, num_cache_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+                for slot in range(module.num_kv_slots):
+                    module.k_cache[slot] = self.kv_cache[0, layer_id]
+                    module.v_cache[slot] = self.kv_cache[1, layer_id]
+                    layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

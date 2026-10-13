@@ -88,6 +88,12 @@ class OuroConfig(KavorConfig):
             **kwargs,
         )
 
+        if getattr(self, "early_exit_step", None) is not None or self.early_exit_threshold != 1.0:
+            raise NotImplementedError(
+                f"Ouro 的自适应退出还没实现:early_exit_step={getattr(self, 'early_exit_step', None)}, "
+                f"early_exit_threshold={self.early_exit_threshold}。"
+                f"当前只支持 early_exit_step 不设置且 early_exit_threshold=1.0")
+
 
 class OuroMLP(nn.Module):
     def __init__(self, config: OuroConfig):
@@ -129,7 +135,7 @@ class OuroAttention(nn.Module):
         self.total_num_kv_heads = config.num_key_value_heads
         assert self.total_num_kv_heads % tp_size == 0
         self.num_kv_heads = self.total_num_kv_heads // tp_size
-        self.head_dim = config.head_dim or config.hidden_size // self.total_num_heads
+        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
@@ -175,22 +181,24 @@ class OuroAttention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
+            num_kv_slots=config.total_ut_steps,
         )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        ut_step: int = 0,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
+
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
+        o = self.attn(q, k, v, ut_step)
         output = self.o_proj(o.flatten(1, -1))
 
         return output
@@ -220,13 +228,15 @@ class OuroDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
+        ut_step: int = 0,
     ) -> tuple[torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
         hidden_states = self.self_attn(
             position_ids,
-            hidden_states
+            hidden_states,
+            ut_step,
         )
         hidden_states = self.input_layernorm_2(hidden_states)
         hidden_states = residual + hidden_states
@@ -269,11 +279,12 @@ class OuroModel(nn.Module):
 
         # 同一组层跑 total_ut_steps 轮,每轮都被 norm 后喂给下一轮;
         # early_exit_threshold=1.0 时自适应退出退化为"永远用最后一轮",所以这里直接返回最后一轮
-        for _ in range(self.total_ut_steps):
+        for ut_step in range(self.total_ut_steps):
             for decoder_layer in self.layers:
                 hidden_states = decoder_layer(
                     hidden_states,
-                    position_ids
+                    position_ids,
+                    ut_step,
                 )
 
             hidden_states = self.norm(hidden_states)
