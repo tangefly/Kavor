@@ -27,13 +27,7 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:43781", world_size=self.world_size, rank=rank, device_id=torch.device(f"cuda:{rank}"))
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        
-        # Compatible with multimodal models
-        if hasattr(hf_config, "text_config"):
-            torch.set_default_dtype(hf_config.text_config.dtype)
-        else:
-            torch.set_default_dtype(hf_config.dtype)
-        
+        torch.set_default_dtype(config.text_config.dtype)
         torch.set_default_device("cuda")
         self.model = AutoModelForCausalLM.from_pretrained(hf_config, use_tqdm=self.enable_log)
         self.sampler = Sampler()
@@ -115,18 +109,18 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
+        text_config = config.text_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        num_kv_heads = text_config.num_key_value_heads // self.world_size
+        head_dim = getattr(text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
         # 一个 Attention 模块可能占多个 KV cache slot(Ouro 的每个循环步各占一份),
         # 缓存层数按模块实际占用算,普通模型就是 num_hidden_layers
         num_cache_layers = sum(
             module.num_kv_slots for module in self.model.modules() if hasattr(module, "k_cache"))
-        block_bytes = 2 * num_cache_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        block_bytes = 2 * num_cache_layers * self.block_size * num_kv_heads * head_dim * text_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         if self.enable_log:
@@ -135,7 +129,7 @@ class ModelRunner:
                 config.num_kvcache_blocks, self.block_size,
                 config.num_kvcache_blocks * block_bytes / 2**30, block_bytes / self.block_size / 1024,
             )
-        self.kv_cache = torch.empty(2, num_cache_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, num_cache_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, dtype=text_config.dtype)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):

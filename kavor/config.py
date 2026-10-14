@@ -15,6 +15,8 @@ class Config:
     enforce_eager: bool = False
     trust_remote_code: bool = False
     hf_config: AutoConfig | None = None
+    text_config: AutoConfig = None,
+    vision_config: AutoConfig = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
@@ -25,9 +27,10 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
-
-        # Compatible with multimodal models
-        if getattr(self.hf_config, "text_config", None) is not None:
-            self.hf_config = self.hf_config.text_config
-        max_position_embeddings = self.hf_config.max_position_embeddings
+        if self.hf_config.vision_config:
+            self.text_config = self.hf_config.text_config
+            self.vision_config = self.hf_config.vision_config
+        else:
+            self.text_config = self.hf_config
+        max_position_embeddings = self.text_config.max_position_embeddings
         self.max_model_len = min(self.max_model_len, max_position_embeddings)
