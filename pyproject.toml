@@ -5,19 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kavor"
 version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
+authors = [{ name = "Xunpeng Xiao" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
-dependencies = [
-    "torch>=2.4.0",
-    "triton>=3.0.0",
-    "transformers>=4.51.0",
-    "flash-attn",
-    "xxhash",
-]
+dynamic = ["dependencies"]
 
 [project.urls]
 Homepage="https://github.com/tangefly/Kavor"

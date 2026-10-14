@@ -20,7 +20,8 @@ class Config:
     num_kvcache_blocks: int = -1
 
     def __post_init__(self):
-        assert os.path.isdir(self.model)
+        if not os.path.isdir(self.model):
+            raise RuntimeError(f"Model not found: {self.model}")
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
