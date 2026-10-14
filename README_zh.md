@@ -51,11 +51,12 @@ CUDA_VISIBLE_DEVICES=0,1 kavor serve Mistral-7B-Instruct-v0.2 \
 
 ## 支持的模型
 
-| 家族 | Hugging Face | ModelScope |
-|----------------|-------------|-------------|
-| Qwen3           | [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)     |      [Qwen3-0.6B](https://www.modelscope.cn/models/Qwen/Qwen3-0.6B)      |
-| Mistral         | [Mistral-7B-Instruct-v0.2](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2)     |      [Mistral-7B-Instruct-v0.2](https://www.modelscope.cn/models/AI-ModelScope/Mistral-7B-Instruct-v0.2/summary)      |
-| ERNIE 4.5         | [ERNIE-4.5-0.3B-PT](https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT)     |      [ERNIE-4.5-0.3B-PT](https://www.modelscope.cn/models/PaddlePaddle/ERNIE-4.5-0.3B-PT)      |
+| 家族 | Hugging Face |
+|----------------|-------------|
+| Qwen3           | [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)     |
+| Mistral         | [Mistral-7B-Instruct-v0.2](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2)     | 
+| ERNIE 4.5         | [ERNIE-4.5-0.3B-PT](https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT)     |
+| Ouro         | [Ouro-1.4B](https://huggingface.co/ByteDance/Ouro-1.4B), [Ouro-1.4B-Thinking](https://huggingface.co/ByteDance/Ouro-1.4B-Thinking), [Ouro-2.6B](https://huggingface.co/ByteDance/Ouro-2.6B), [Ouro-2.6B-Thinking](https://huggingface.co/ByteDance/Ouro-2.6B-Thinking)     |
 
 ## 性能测试
 
