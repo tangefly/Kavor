@@ -6,6 +6,7 @@ from time import monotonic, perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoProcessor
 import torch.multiprocessing as mp
+import torch
 
 from kavor.config import Config
 from kavor.sampling_params import SamplingParams
@@ -51,7 +52,6 @@ class LLMEngine:
             self.model_runner = ModelRunner(config, 0, self.events)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 config.model, use_fast=True, trust_remote_code=config.trust_remote_code)
-            # 只有带视觉塔的模型才需要 processor,文本模型上 AutoProcessor 只会退化成 tokenizer
             self.processor = (
                 AutoProcessor.from_pretrained(config.model, trust_remote_code=config.trust_remote_code)
                 if getattr(config, "vision_config", None) is not None else None)
@@ -97,31 +97,22 @@ class LLMEngine:
 
     def build_mm_inputs(self, messages: list[dict], max_pixels: int | None = None,
                         **template_kwargs) -> MultiModalInputs:
-        """OpenAI 风格 messages(带图/视频) → MultiModalInputs,可以直接喂给 generate。
-
-        例:llm.build_mm_inputs([{"role": "user", "content": [
-                {"type": "image", "image": Image.open(path)}, {"type": "text", "text": "描述这张图"}]}])
-        """
         assert self.processor is not None, (
             f"{self.config.model} 没有 processor(AutoProcessor),不支持多模态输入")
         return MultiModalInputs.build_mm_inputs(
             self.tokenizer, self.processor, messages, max_pixels=max_pixels, **template_kwargs)
 
-    def add_request(self, prompt: str | list[int] | MultiModalInputs,
-                    sampling_params: SamplingParams) -> int:
-        """prompt 可以是纯文本、已 tokenize 的 id 列表,或带多模态附件的 MultiModalInputs。"""
-        mm = prompt if isinstance(prompt, MultiModalInputs) else None
-        if mm is not None:
-            if len(mm.token_ids) > self.config.max_num_batched_tokens:
-                raise ValueError(
-                    f"多模态 prompt 有 {len(mm.token_ids)} 个 token,超过 max_num_batched_tokens"
-                    f"({self.config.max_num_batched_tokens}):多模态序列的 prefill 不切分,排不下就会一直等。"
-                    "调大 --max-num-batched-tokens,或用更小的图/更少的帧")
-            prompt = mm.token_ids
-        elif isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
-        seq.mm = mm
+    def add_request(
+        self, 
+        mm_input: MultiModalInputs,
+        sampling_params: SamplingParams
+    ) -> int:
+        if len(mm_input.token_ids) > self.config.max_num_batched_tokens:
+            raise ValueError(
+                f"多模态 prompt 有 {len(mm_input.token_ids)} 个 token,超过 max_num_batched_tokens"
+                f"({self.config.max_num_batched_tokens}):多模态序列的 prefill 不切分,排不下就会一直等。"
+                "调大 --max-num-batched-tokens,或用更小的图/更少的帧")
+        seq = Sequence(mm_input, sampling_params)
         self.scheduler.add(seq)
         return seq.seq_id
 
@@ -142,20 +133,43 @@ class LLMEngine:
 
     def is_finished(self):
         return self.scheduler.is_finished()
+    
+    def normalize_input(
+        self, 
+        inputs: list[str] | list[list[int]] | list[MultiModalInputs]
+    ) -> list[MultiModalInputs]:
+        mm_inputs = []
+        for input in inputs:
+            if isinstance(input, MultiModalInputs):
+                mm_inputs.append(input)
+            elif isinstance(input, str):
+                token_ids = self.tokenizer.encode(input)
+                mm_inputs.append(MultiModalInputs(token_ids, input))
+            elif isinstance(input, int):
+                mm_inputs.append(MultiModalInputs(torch.tensor(input), None))
+            else:
+                raise RuntimeError("Not supported data type!")
+        return mm_inputs
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]] | list[MultiModalInputs],
+        inputs: list[str] | list[list[int]] | list[MultiModalInputs],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        
+        mm_inputs = self.normalize_input(inputs)
         if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+            sampling_params = [sampling_params] * len(mm_inputs)
+        for mm_input, sp in zip(mm_inputs, sampling_params):
+            self.add_request(mm_input, sp)
+        
         outputs = {}
-        prefill_throughput = decode_throughput = 0.
+        
+        prefill_throughput = 0.
+        decode_throughput = 0.
+        
+        pbar = tqdm(total=len(mm_inputs), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()

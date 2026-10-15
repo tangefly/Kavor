@@ -20,24 +20,19 @@ import torch
 from PIL import Image
 
 
-MAX_IMAGE_BYTES = 32 * 2**20    # 单张图的字节上限,挡住"URL 指向一个几百 MB 的文件"
-
+MAX_IMAGE_BYTES = 32 * 2**20
 
 @dataclass
 class MultiModalInputs:
-    """一次请求里的全部非文本输入,连同 processor 展开好的 token_ids。
 
-    引擎不认识这些字段,只负责原样带到 prefill;语义由模型侧解释。
-    """
-
-    token_ids: list[int]                            # 占位符已展开的 input_ids
-    prompt: str                                     # 渲染原文(解析输出时要用它判断状态)
-    mm_token_type_ids: list[int] | None = None      # 0=文本 1=图 2=视频;模型按它算 mrope 位置
-    pixel_values: torch.Tensor | None = None        # (总 patch 数, 3*2*16*16) float32, CPU
-    image_grid_thw: torch.Tensor | None = None      # (图数, 3),patch 单位 (T, H/16, W/16)
+    token_ids: list[int]
+    prompt: str
+    mm_token_type_ids: list[int] | None = None
+    pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
     pixel_values_videos: torch.Tensor | None = None
     video_grid_thw: torch.Tensor | None = None
-    rope_delta: int = 0                             # prefill 时由模型回填,解码步的位置要加它
+    rope_delta: int = 0
 
     def for_workers(self, prefill: bool) -> "MultiModalInputs":
         if prefill:

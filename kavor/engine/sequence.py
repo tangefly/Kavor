@@ -1,8 +1,20 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+import torch
+from dataclasses import dataclass
 
 from kavor.sampling_params import SamplingParams
+from .multimodal import MultiModalInputs
+
+@dataclass
+class MultiModalVisionData:
+    mm_token_type_ids: list[int] | None = None
+    pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+    pixel_values_videos: torch.Tensor | None = None
+    video_grid_thw: torch.Tensor | None = None
+    rope_delta: int = 0
 
 
 class SequenceStatus(Enum):
@@ -15,19 +27,30 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, mm_inputs: MultiModalInputs, sampling_params = SamplingParams()):
         
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
-        self.token_ids = copy(token_ids)
-        self.last_token = token_ids[-1]
+        
+        self.token_ids = copy(mm_inputs.token_ids)
+        self.mm = MultiModalVisionData(
+            mm_token_type_ids=mm_inputs.mm_token_type_ids,
+            pixel_values=mm_inputs.pixel_values,
+            image_grid_thw=mm_inputs.image_grid_thw,
+            pixel_values_videos=mm_inputs.pixel_values_videos,
+            video_grid_thw=mm_inputs.video_grid_thw,
+            rope_delta=mm_inputs.rope_delta
+        )
+        
+        self.last_token = self.token_ids[-1]
         self.num_tokens = len(self.token_ids)
-        self.num_prompt_tokens = len(token_ids)
+        self.num_prompt_tokens = len(self.token_ids)
+        
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
-        self.mm = None
+        
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -76,8 +99,6 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        # mm 只带 worker 用得到的那部分(见 MultiModalInputs.for_workers):像素张量留在 rank0,
-        # 它要单独走一次广播,塞进这块共享内存会直接撑爆。
         mm = None if self.mm is None else self.mm.for_workers(prefill=self.is_prefill)
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm)
 
