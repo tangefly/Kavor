@@ -9,6 +9,7 @@ from kavor.engine.sequence import Sequence
 from kavor.layers.sampler import Sampler
 from kavor.utils.context import set_context, get_context, reset_context
 from kavor.utils.logger import logger
+from kavor.utils.mm_plan import plan_shards
 from kavor.models import AutoModelForCausalLM
 
 
@@ -86,6 +87,12 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
+        if n + 4 > len(self.shm.buf):
+            raise RuntimeError(
+                f"要发给 TP worker 的数据有 {n / 2**20:.1f} MB,超过共享内存 "
+                f"{len(self.shm.buf) / 2**20:.0f} MB:args 里不要夹带大张量"
+                "(多模态的像素张量应该在 MultiModalInputs.for_workers 里就被丢掉,"
+                "改走 _scatter_mm 那条 NCCL 数据面)")
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
@@ -157,20 +164,49 @@ class ModelRunner:
         return self.model.mm_position_ids(seq)[:, start:end]
 
     def prepare_mm_inputs(self, seqs: list[Sequence]) -> dict:
-        """把这一批序列的多模态张量拼起来(拼接顺序 = 序列顺序 = 打包后的 token 顺序)。
-
-        模型侧靠 masked_scatter 按占位符位置填 embedding,顺序错了不报错、只是答错,
-        所以这里严格按 seqs 的顺序拼。
-        """
         mm_seqs = [seq for seq in seqs if seq.mm is not None]
         if not mm_seqs:
             return {}
-        kwargs = {}
-        for key in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"):
-            tensors = [getattr(seq.mm, key) for seq in mm_seqs if getattr(seq.mm, key) is not None]
-            if tensors:
-                kwargs[key] = torch.cat(tensors, dim=0).cuda(non_blocking=True)
+        kwargs = {"mm_present": True}
+        for pixel_key, grid_key in (("pixel_values", "image_grid_thw"),
+                                    ("pixel_values_videos", "video_grid_thw")):
+            grids = [getattr(seq.mm, grid_key) for seq in mm_seqs
+                     if getattr(seq.mm, grid_key) is not None]
+            if not grids:
+                continue
+            pixels = [getattr(seq.mm, pixel_key) for seq in mm_seqs
+                      if getattr(seq.mm, pixel_key) is not None]
+            kwargs[grid_key] = torch.cat(grids, dim=0).cuda(non_blocking=True)
+            kwargs[pixel_key] = self._scatter_mm(pixels, kwargs[grid_key])
         return kwargs
+
+    def _scatter_mm(self, pixels: list[torch.Tensor], grid: torch.Tensor) -> torch.Tensor:
+        world = self.world_size
+        rows = grid.prod(-1).tolist()
+        counts = [shard.row_end - shard.row_start for shard in plan_shards(rows, world)]
+        vision_config = self.config.vision_config
+        patch_dim = (vision_config.in_channels * vision_config.temporal_patch_size
+                     * vision_config.patch_size ** 2)
+        dtype = self.model.mm_pixel_dtype
+
+        if world == 1:
+            assert pixels, "有 grid 却没有像素张量"
+            return torch.cat(pixels, dim=0).to(device="cuda", dtype=dtype)
+
+        device = torch.device("cuda", self.rank)
+        if self.rank == 0:
+            assert pixels, "rank0 上有 grid 却没有像素张量"
+            # 按视觉塔的 dtype 传:塔里第一件事就是这个转换,提前做结果逐位相同、字节减半
+            src = torch.cat(pixels, dim=0).to(device=device, dtype=dtype)
+        else:
+            src = torch.empty(0, patch_dim, dtype=dtype, device=device)
+        mine = torch.empty(counts[self.rank], patch_dim, dtype=dtype, device=device)
+        dist.all_to_all_single(
+            mine, src,
+            output_split_sizes=[counts[self.rank] if i == 0 else 0 for i in range(world)],
+            input_split_sizes=counts if self.rank == 0 else [0] * world,
+        )
+        return mine
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -229,8 +265,6 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            # 多模态序列的位置被图像"压缩"过(一张图占的 token 远多于它占的位置数),
-            # 所以要加上 prefill 时算出来的 rope_delta;纯文本序列 delta=0。
             positions.append(len(seq) - 1 + (seq.mm.rope_delta if seq.mm is not None else 0))
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)

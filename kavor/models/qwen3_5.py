@@ -10,9 +10,15 @@ from kavor.layers.activation import SiluAndMul
 from kavor.layers.attention import Attention
 from kavor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from kavor.layers.layernorm import RMSNorm
-from kavor.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from kavor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from kavor.layers.rotary_embedding import apply_rotary_emb
 from kavor.utils.context import get_context
+from kavor.utils.mm_plan import plan_shards
 
 from transformers.activations import ACT2FN
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
@@ -335,15 +341,28 @@ def torch_recurrent_gated_delta_rule(
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
+
     def __init__(self, config: Qwen3_5Config, layer_idx: int):
         super().__init__()
+        tp_size = dist.get_world_size()
+        self.tp_size = tp_size
+        self.tp_rank = dist.get_rank()
         self.hidden_size = config.hidden_size
-        self.num_v_heads = config.linear_num_value_heads
-        self.num_k_heads = config.linear_num_key_heads
+        self.total_num_v_heads = config.linear_num_value_heads
+        self.total_num_k_heads = config.linear_num_key_heads
+        assert self.total_num_k_heads % tp_size == 0 and self.total_num_v_heads % tp_size == 0, (
+            f"线性注意力的头数(k={self.total_num_k_heads}, v={self.total_num_v_heads})"
+            f"必须都能被 tensor_parallel_size={tp_size} 整除")
+        assert self.total_num_v_heads % self.total_num_k_heads == 0, (
+            f"v 头数({self.total_num_v_heads})必须是 k 头数({self.total_num_k_heads})的整数倍(GQA 展开)")
+        self.num_v_heads = self.total_num_v_heads // tp_size
+        self.num_k_heads = self.total_num_k_heads // tp_size
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
+        self.total_key_dim = self.head_k_dim * self.total_num_k_heads
+        self.total_value_dim = self.head_v_dim * self.total_num_v_heads
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
@@ -360,28 +379,60 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=self.conv_kernel_size - 1,
         )
+        self.conv1d.weight.weight_loader = self.conv_weight_loader
 
         # time step projection (discretization)
         # instantiate once and copy inv_dt in init_weights of PretrainedModel
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        self.dt_bias.weight_loader = self.v_head_weight_loader
 
         # Lower bound kept away from 0 so log(A) never becomes -inf
         A = torch.empty(self.num_v_heads).uniform_(0.01, 16)
         self.A_log = nn.Parameter(torch.log(A))
+        self.A_log.weight_loader = self.v_head_weight_loader
 
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        self.out_proj = RowParallelLinear(self.total_value_dim, self.hidden_size, bias=False)
 
         self.layer_type = config.layer_types[layer_idx]
 
-        self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-
-        # 每序列的推理状态:序列首块 id -> (conv_state [conv_dim, k-1], recurrent_state [num_v_heads, k_dim, v_dim], 已处理 token 数)
-        # 这块显存完全由模型自己向 GPU 要,不占引擎的 KV cache 预算;prefix cache 命中的序列没有状态,会显式报错。
+        self.in_proj_qkv = MergedColumnParallelLinear(
+            self.hidden_size,
+            [self.total_key_dim, self.total_key_dim, self.total_value_dim],
+            bias=False,
+        )
+        self.in_proj_qkv.weight.weight_loader = self.qkv_weight_loader
+        self.in_proj_z = ColumnParallelLinear(self.hidden_size, self.total_value_dim, bias=False)
+        self.in_proj_b = ColumnParallelLinear(self.hidden_size, self.total_num_v_heads, bias=False)
+        self.in_proj_a = ColumnParallelLinear(self.hidden_size, self.total_num_v_heads, bias=False)
         self.states: dict[int, tuple[torch.Tensor, torch.Tensor, int]] = {}
+
+    def _qkv_segment_sizes(self) -> tuple[int, int, int]:
+        """[q | k | v] 三段在**全局**张量里的宽度(in_proj_qkv 的行、conv1d 的通道同序)。"""
+        return self.total_key_dim, self.total_key_dim, self.total_value_dim
+
+    def qkv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """拆 [q | k | v] 三段,分别交给 MergedColumnParallelLinear 的标准 loader 切本 rank 的头。"""
+        offset = 0
+        for shard_id, size in enumerate(self._qkv_segment_sizes()):
+            MergedColumnParallelLinear.weight_loader(
+                self.in_proj_qkv, param, loaded_weight.narrow(0, offset, size), shard_id)
+            offset += size
+
+    def conv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """卷积权重 [conv_dim, 1, K]:偏移和 qkv_weight_loader 的段内偏移逐段对齐。"""
+        pieces = []
+        offset = 0
+        for size in self._qkv_segment_sizes():
+            local = size // self.tp_size
+            pieces.append(loaded_weight.narrow(0, offset + self.tp_rank * local, local))
+            offset += size
+        param.data.copy_(torch.cat(pieces, dim=0))
+
+    def v_head_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """A_log / dt_bias:[total_num_v_heads] 每个 v 头一个标量,和 in_proj_z/b/a 的行同序。"""
+        local = self.num_v_heads
+        param.data.copy_(loaded_weight.narrow(0, self.tp_rank * local, local))
 
     def forward(
         self,
@@ -389,30 +440,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         linear_state_keys: list[int] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """门控 delta 规则(token mixer)。
 
-        Kavor 传进来的是拼平的 token 序列(序列边界在 context.cu_seqlens 里),所以这里按序列组织:
-
-        - prefill:逐序列切片,从零状态做因果卷积 + chunk 版 delta rule,算完把状态存进 self.states;
-        - decode:每条序列一个 token,batch 起来走单步 recurrent 版,kernel 就地更新卷积状态。
-
-        状态用"序列首块 id"认领(见 Qwen3_5TextModel._linear_state_keys),显存由模型自己向 GPU 要。
-        """
         assert linear_state_keys is not None, "线性注意力层需要序列身份(linear_state_keys)"
         if get_context().is_prefill:
             return self._prefill(hidden_states, linear_state_keys)
         return self._decode(hidden_states, linear_state_keys)
 
     def _beta_g(self, hidden_states: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """beta:状态的写入强度(0~1);g:对数空间的每步衰减。形状都是 [B, T, num_v_heads]"""
         a = self.in_proj_a(hidden_states).view(-1, seq_len, self.num_v_heads)
         beta = self.in_proj_b(hidden_states).view(-1, seq_len, self.num_v_heads).sigmoid()
-        # 如果模型以 fp16 加载,不加 .float() 的话 A 可能是 -inf
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         return beta, g
 
     def _split_qkv(self, mixed_qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """[B, T, conv_dim] -> q/k/v,各 [B, T, num_v_heads, head_dim](q/k 按 GQA 比例展开到和 v 一样多)"""
         batch_size, seq_len, _ = mixed_qkv.shape
         query, key, value = torch.split(
             mixed_qkv,
@@ -613,21 +653,10 @@ def eager_attention_forward(
 
 
 class Qwen3_5MRotaryEmbedding(nn.Module):
-    """Qwen3.5 的 M-RoPE:三条位置流(T/H/W)按 mrope_section 交织。
-
-    config 里 mrope_section=[11,11,10]、partial_rotary_factor=0.25 → rotary_dim=64、32 个频率。
-    交织规则(与 HF 的 Qwen3_5TextRotaryEmbedding 逐频率比对过):
-    **第 j 个频率取自第 j%3 条流**(0=T, 1=H, 2=W),也就是 T 占 0,3,..,30;H 占 1,4,..,31;W 占 2,5,..,29。
-    注意这只是"频率位在三条流之间交错",配对方式仍是"前后半分半"(和 Kavor 原来的
-    RotaryEmbedding 一致),不是 Ernie4_5 那种相邻成对。
-
-    三条流相同时(纯文本)交织是恒等变换,所以纯文本可以直接传 1-D 位置,结果与原来完全一致。
-    """
 
     def __init__(self, rotary_dim: int, base: float, mrope_section):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        # 每个频率位属于哪条流:默认全归 T,H/W 两条流按 mrope_section 覆盖自己的位置
         freq_row = torch.zeros(inv_freq.numel(), dtype=torch.long)
         for dim, offset in enumerate((1, 2), start=1):      # dim=1 → H,dim=2 → W
             freq_row[offset : mrope_section[dim] * 3 : 3] = dim
@@ -637,10 +666,8 @@ class Qwen3_5MRotaryEmbedding(nn.Module):
     def forward(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor):
         if positions.dim() == 1:    # 纯文本:三条流相同
             positions = positions.unsqueeze(0).expand(3, -1)
-        # 位置表按需算(不预先建 max_position × 32 的表):(3, N, n_freq)
         freqs = positions.float()[:, :, None] * self.inv_freq[None, None, :]
         n_freq = self.inv_freq.numel()
-        # 中间那一维是给 head 广播用的(q/k 是 (N, heads, rotary_dim))
         cos = torch.empty(positions.shape[1], 1, n_freq, dtype=torch.float32, device=positions.device)
         sin = torch.empty_like(cos)
         for row in range(3):
@@ -659,10 +686,13 @@ class Qwen3_5Attention(nn.Module):
         
         tp_size = dist.get_world_size()
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
+        assert self.total_num_heads % tp_size == 0, (
+            f"注意力头数({self.total_num_heads})不能被 tensor_parallel_size={tp_size} 整除")
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        assert self.total_num_kv_heads % tp_size == 0
+        assert self.total_num_kv_heads % tp_size == 0, (
+            f"KV 头数({self.total_num_kv_heads})不能被 tensor_parallel_size={tp_size} 整除:"
+            f"这个模型的 TP 上限是 {self.total_num_kv_heads}")
         self.num_kv_heads = self.total_num_kv_heads // tp_size
         self.head_dim = config.head_dim or config.hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
@@ -718,8 +748,6 @@ class Qwen3_5Attention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         qkv = self.qkv_proj(hidden_states)
-        # 注意 q_proj 的行是"每个 head 内 [q | gate]"交错排的,不是"所有 q 然后所有 gate"。
-        # 所以要先按 2*q_size 整体切出来,再 view 成 (..., 2*head_dim) 沿最后一维对半切。
         query_gate, key_states, value_states = qkv.split(
             [2 * self.q_size, self.kv_size, self.kv_size], dim=-1)
         query_states, gate = query_gate.view(
@@ -732,7 +760,7 @@ class Qwen3_5Attention(nn.Module):
 
         if self.rotary_dim == self.head_dim:
             query_states, key_states = self.rotary_emb(position_ids, query_states, key_states)
-        else:   # 只有前 rotary_dim 维参与旋转,其余维度直接拼回去
+        else:
             query_rot, key_rot = self.rotary_emb(
                 position_ids, query_states[..., : self.rotary_dim], key_states[..., : self.rotary_dim]
             )
@@ -1077,7 +1105,7 @@ class Qwen3_5TextModel(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
         self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -1085,15 +1113,6 @@ class Qwen3_5TextModel(nn.Module):
         self.has_linear_attention = any(t == "linear_attention" for t in config.layer_types)
 
     def linear_state_keys(self) -> list[int] | None:
-        """给每条被调度的序列一个身份,线性注意力层用它认领自己的状态。
-
-        这条身份必须"同一条序列跨步不变,不同序列互不相同"。Kavor 的引擎里没有现成的序列 id 可用,
-        但 KV cache 的首块满足这两点:序列活着期间 block_table 只 append(首块不变),而一个物理块
-        同一时刻只属于一条序列。于是:
-        - decode:context.block_tables[i, 0] 就是第 i 条序列的首块;
-        - prefill:没有 block_tables,但此时序列必然从头开始算(start=0),第一个 token 正好落在自己
-          首块的第 0 格,所以 slot_mapping[cu_seqlens_q[i]] // block_size 也是首块 id。
-        """
         context = get_context()
         block_size = self._kv_block_size()
         if context.is_prefill:
@@ -1263,6 +1282,32 @@ class Qwen3_5Model(nn.Module):
 
         return image_embeds
 
+    def _vision_features_parallel(self, get_features, pixel_values, grid_thw, **kwargs) -> torch.Tensor:
+        world = dist.get_world_size()
+        rank = dist.get_rank()
+        rows = grid_thw.prod(-1).tolist()
+        shards = plan_shards(rows, world)
+        tokens = (grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        offsets, total = [], 0
+        for shard in shards:
+            n = sum(tokens[shard.item_start:shard.item_end])
+            offsets.append((total, total + n))
+            total += n
+
+        full = torch.empty(total, self.config.vision_config.out_hidden_size,
+                           dtype=self.visual.patch_embed.proj.weight.dtype,
+                           device=pixel_values.device)
+        mine = shards[rank]
+        if mine.row_end > mine.row_start:
+            embeds = get_features(pixel_values, grid_thw[mine.item_start:mine.item_end], **kwargs)
+            full[offsets[rank][0]:offsets[rank][1]] = torch.cat(embeds, dim=0)
+
+        if world > 1:
+            for src, (start, end) in enumerate(offsets):
+                if end > start:
+                    dist.broadcast(full[start:end], src=src)
+        return full
+
     def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
@@ -1356,30 +1401,31 @@ class Qwen3_5Model(nn.Module):
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
+        mm_present: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ):
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
         if pixel_values is not None:
-            # get_image_features 返回的是按图切好的 tuple,顺序与占位符出现顺序一致
-            image_embeds = self.get_image_features(pixel_values, image_grid_thw, **kwargs)
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_embeds = self._vision_features_parallel(
+                self.get_image_features, pixel_values, image_grid_thw, **kwargs)
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            video_embeds = self._vision_features_parallel(
+                self.get_video_features, pixel_values_videos, video_grid_thw, **kwargs)
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         if position_ids is None:
-            if pixel_values is not None or pixel_values_videos is not None:
-                # Kavor 走这条路时 runner 总是显式传 3D 位置,这里是脱离引擎直接调模型时的兜底
+            if pixel_values is not None or pixel_values_videos is not None or mm_present:
                 position_ids = self.compute_3d_position_ids(
                     input_ids=input_ids,
                     image_grid_thw=image_grid_thw,
@@ -1390,7 +1436,6 @@ class Qwen3_5Model(nn.Module):
                     mm_token_type_ids=mm_token_type_ids,
                 )
             else:
-                # 纯文本:token 序列是拼平的,位置就是 0..N-1(Kavor 的 runner 会显式传 positions)
                 position_ids = torch.arange(inputs_embeds.shape[0], device=inputs_embeds.device)
 
         return self.language_model(
@@ -1418,21 +1463,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         if config.text_config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.language_model.embed_tokens.weight.data
 
-    def mm_position_ids(self, seq) -> torch.LongTensor:
-        """一条多模态序列的 3-D mrope 位置 (3, N),顺便把 rope_delta 写回 seq.mm。
+    @property
+    def mm_pixel_dtype(self):
+        return self.model.visual.patch_embed.proj.weight.dtype
 
-        位置只由 token 序列本身决定(mm_token_type_ids 分段 + grid_thw),与 prefill 怎么切无关,
-        所以每次 prefill 重算就行(preempt 之后重跑也安全)。解码步要用 seq.mm.rope_delta:
-        图像那些 token 只占很少的位置(一张图的位置跨度是 max(H,W)/2),不加它位置就会一直偏大。
-        """
+    def mm_position_ids(self, seq) -> torch.LongTensor:
         mm = seq.mm
-        # device="cpu" 写死:位置计算全程在 CPU 上做,不受全局默认设备影响
         input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long, device="cpu")
         mm_token_type_ids = torch.tensor([mm.mm_token_type_ids], dtype=torch.long, device="cpu")
-        # grid 一律搬回 CPU:get_rope_index 里 current_pos 会被 grid 的 device 带成张量,
-        # 之后和 CPU 上的 arange 相加就炸(CPU 上算位置也更省事)
         image_grid_thw = None if mm.image_grid_thw is None else mm.image_grid_thw.cpu()
-        # get_rope_index 会原地改 video_grid_thw 的 T 维,传副本免得把 seq 上的张量改坏
         video_grid_thw = None if mm.video_grid_thw is None else mm.video_grid_thw.cpu().clone()
         positions, deltas = self.model.get_rope_index(
             input_ids,
@@ -1441,7 +1480,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             video_grid_thw=video_grid_thw,
         )
         mm.rope_delta = int(deltas.flatten()[0])
-        return positions[:, 0]      # get_rope_index 返回 (3, batch, N),这里 batch=1
+        return positions[:, 0]
 
     def forward(
         self,

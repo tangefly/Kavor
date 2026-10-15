@@ -112,8 +112,6 @@ class LLMEngine:
         """prompt 可以是纯文本、已 tokenize 的 id 列表,或带多模态附件的 MultiModalInputs。"""
         mm = prompt if isinstance(prompt, MultiModalInputs) else None
         if mm is not None:
-            # token_ids 已经由 processor 展开过占位符,不能再 tokenize 一遍
-            assert self.config.tensor_parallel_size == 1, "多模态输入目前只支持单卡"
             if len(mm.token_ids) > self.config.max_num_batched_tokens:
                 raise ValueError(
                     f"多模态 prompt 有 {len(mm.token_ids)} 个 token,超过 max_num_batched_tokens"
