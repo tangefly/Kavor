@@ -24,7 +24,9 @@ class ModelRunner:
         self.event = event
         self.enable_log = self.rank == 0
 
-        dist.init_process_group("nccl", "tcp://localhost:43781", world_size=self.world_size, rank=rank, device_id=torch.device(f"cuda:{rank}"))
+        dist.init_process_group(
+            "nccl", f"tcp://localhost:{config.rdzv_port}",
+            world_size=self.world_size, rank=rank, device_id=torch.device(f"cuda:{rank}"))
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(config.text_config.dtype)
@@ -144,6 +146,32 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
+    def _position_ids(self, seq: Sequence, start: int, end: int) -> torch.Tensor:
+        """一条序列在 [start, end) 上的 3-D 位置 (3, seqlen)。
+
+        多模态批次里所有序列都走 3-D:纯文本序列三条流相同,数学上和原来的 1-D 位置等价;
+        多模态序列由模型按 mm_token_type_ids 分段算,顺便把 rope_delta 写回 seq.mm(解码步要用)。
+        """
+        if seq.mm is None:
+            return torch.arange(start, end).unsqueeze(0).expand(3, -1)
+        return self.model.mm_position_ids(seq)[:, start:end]
+
+    def prepare_mm_inputs(self, seqs: list[Sequence]) -> dict:
+        """把这一批序列的多模态张量拼起来(拼接顺序 = 序列顺序 = 打包后的 token 顺序)。
+
+        模型侧靠 masked_scatter 按占位符位置填 embedding,顺序错了不报错、只是答错,
+        所以这里严格按 seqs 的顺序拼。
+        """
+        mm_seqs = [seq for seq in seqs if seq.mm is not None]
+        if not mm_seqs:
+            return {}
+        kwargs = {}
+        for key in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"):
+            tensors = [getattr(seq.mm, key) for seq in mm_seqs if getattr(seq.mm, key) is not None]
+            if tensors:
+                kwargs[key] = torch.cat(tensors, dim=0).cuda(non_blocking=True)
+        return kwargs
+
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -153,13 +181,17 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        has_mm = any(seq.mm is not None for seq in seqs)
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
             input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
+            if has_mm:
+                positions.append(self._position_ids(seq, start, end))
+            else:
+                positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
@@ -180,7 +212,10 @@ class ModelRunner:
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        if has_mm:
+            positions = torch.cat(positions, dim=1).cuda(non_blocking=True)     # (3, 总 token 数)
+        else:
+            positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -194,7 +229,9 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
+            # 多模态序列的位置被图像"压缩"过(一张图占的 token 远多于它占的位置数),
+            # 所以要加上 prefill 时算出来的 rope_delta;纯文本序列 delta=0。
+            positions.append(len(seq) - 1 + (seq.mm.rope_delta if seq.mm is not None else 0))
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -211,9 +248,9 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, mm_kwargs: dict | None = None):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            logits = self.model(input_ids, positions)
+            logits = self.model(input_ids, positions, **(mm_kwargs or {}))
             return self.model.compute_logits(logits)
         else:
             bs = input_ids.size(0)
@@ -232,8 +269,9 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        mm_kwargs = self.prepare_mm_inputs(seqs) if is_prefill else {}
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions, is_prefill, mm_kwargs)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

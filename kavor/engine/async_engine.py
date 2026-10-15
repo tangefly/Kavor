@@ -11,6 +11,8 @@ import torch
 from kavor.engine.llm_engine import LLMEngine
 from kavor.sampling_params import SamplingParams
 
+from .multimodal import MultiModalInputs
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +33,7 @@ class AsyncEngine:
         self.model_name = kwargs["model_name"] or model
         self.engine = LLMEngine(model, **kwargs)
         self.tokenizer = self.engine.tokenizer
+        self.processor = self.engine.processor
         self.loop: asyncio.AbstractEventLoop | None = None
 
         self.incoming: queue.Queue = queue.Queue()
@@ -46,7 +49,7 @@ class AsyncEngine:
         self.thread = threading.Thread(target=self._engine_loop, name="kavor-engine", daemon=True)
         self.thread.start()
 
-    async def add_request(self, request_id: str, prompt: str,
+    async def add_request(self, request_id: str, prompt: str | list[int] | MultiModalInputs,
                           sampling_params: SamplingParams) -> asyncio.Queue:
         if self._exc is not None:
             raise RuntimeError(f"引擎线程已因异常退出: {self._exc!r}")

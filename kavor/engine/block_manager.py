@@ -59,15 +59,19 @@ class BlockManager:
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                break
-            num_cached_blocks += 1
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
+        # 多模态序列不复用 prefix cache:图片段全是同一个 image_pad token id,
+        # 两张尺寸相同的**不同**图片会算出同一个 block 哈希,复用就等于"换了图答案不变"。
+        # (而且模型侧的线性注意力也要求序列从头开始,见 qwen3_5.py 里的 start == 0 断言)
+        if seq.mm is None:
+            for i in range(seq.num_blocks - 1):
+                token_ids = seq.block(i)
+                h = self.compute_hash(token_ids, h)
+                block_id = self.hash_to_block_id.get(h, -1)
+                if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                    break
+                num_cached_blocks += 1
+                if block_id in self.used_block_ids:
+                    num_new_blocks -= 1
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks

@@ -11,12 +11,11 @@ from kavor.layers.attention import Attention
 from kavor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from kavor.layers.layernorm import RMSNorm
 from kavor.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from kavor.layers.rotary_embedding import get_rope
+from kavor.layers.rotary_embedding import apply_rotary_emb
 from kavor.utils.context import get_context
 
 from transformers.activations import ACT2FN
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.processing_utils import Unpack
 from transformers.utils import (
     TransformersKwargs,
@@ -613,6 +612,45 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+class Qwen3_5MRotaryEmbedding(nn.Module):
+    """Qwen3.5 的 M-RoPE:三条位置流(T/H/W)按 mrope_section 交织。
+
+    config 里 mrope_section=[11,11,10]、partial_rotary_factor=0.25 → rotary_dim=64、32 个频率。
+    交织规则(与 HF 的 Qwen3_5TextRotaryEmbedding 逐频率比对过):
+    **第 j 个频率取自第 j%3 条流**(0=T, 1=H, 2=W),也就是 T 占 0,3,..,30;H 占 1,4,..,31;W 占 2,5,..,29。
+    注意这只是"频率位在三条流之间交错",配对方式仍是"前后半分半"(和 Kavor 原来的
+    RotaryEmbedding 一致),不是 Ernie4_5 那种相邻成对。
+
+    三条流相同时(纯文本)交织是恒等变换,所以纯文本可以直接传 1-D 位置,结果与原来完全一致。
+    """
+
+    def __init__(self, rotary_dim: int, base: float, mrope_section):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        # 每个频率位属于哪条流:默认全归 T,H/W 两条流按 mrope_section 覆盖自己的位置
+        freq_row = torch.zeros(inv_freq.numel(), dtype=torch.long)
+        for dim, offset in enumerate((1, 2), start=1):      # dim=1 → H,dim=2 → W
+            freq_row[offset : mrope_section[dim] * 3 : 3] = dim
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("freq_row", freq_row, persistent=False)
+
+    def forward(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor):
+        if positions.dim() == 1:    # 纯文本:三条流相同
+            positions = positions.unsqueeze(0).expand(3, -1)
+        # 位置表按需算(不预先建 max_position × 32 的表):(3, N, n_freq)
+        freqs = positions.float()[:, :, None] * self.inv_freq[None, None, :]
+        n_freq = self.inv_freq.numel()
+        # 中间那一维是给 head 广播用的(q/k 是 (N, heads, rotary_dim))
+        cos = torch.empty(positions.shape[1], 1, n_freq, dtype=torch.float32, device=positions.device)
+        sin = torch.empty_like(cos)
+        for row in range(3):
+            sel = self.freq_row == row
+            f = freqs[row][:, sel]
+            cos[:, 0, sel] = f.cos()
+            sin[:, 0, sel] = f.sin()
+        return apply_rotary_emb(query, cos, sin), apply_rotary_emb(key, cos, sin)
+
+
 class Qwen3_5Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -656,14 +694,11 @@ class Qwen3_5Attention(nn.Module):
         rope_parameters = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
         rope_theta = rope_parameters.get("rope_theta", getattr(config, "rope_theta", 1000000))
         # partial_rotary_factor=0.25:只转 head_dim 的前 1/4,其余维度原样通过。
-        # 纯文本场景 mrope 的三个位置流相同(interleaved 交织后仍是同一串频率),等价于标准 rope。
         self.rotary_dim = int(self.head_dim * rope_parameters.get("partial_rotary_factor", 1.0))
-        self.rotary_emb = get_rope(
+        self.rotary_emb = Qwen3_5MRotaryEmbedding(
             self.rotary_dim,
-            rotary_dim=self.rotary_dim,
-            max_position=config.max_position_embeddings,
-            base=rope_theta,
-            interleaved=False,
+            rope_theta,
+            rope_parameters.get("mrope_section") or [11, 11, 10],
         )
         
         self.attn = Attention(
@@ -979,6 +1014,7 @@ class Qwen3_5VisionModel(nn.Module):
 
     def __init__(self, config, **kwargs) -> None:
         super().__init__(**kwargs)
+        self.config = config
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_size = config.patch_size
         self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
@@ -1108,6 +1144,7 @@ class Qwen3_5Model(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.config = config        # get_rope_index 要用 config.vision_config.spatial_merge_size
         self.visual = Qwen3_5VisionModel(config.vision_config)
         self.language_model = Qwen3_5TextModel(config.text_config)
         self.rope_deltas = None 
@@ -1210,7 +1247,7 @@ class Qwen3_5Model(nn.Module):
         pixel_values_videos: torch.FloatTensor,
         video_grid_thw: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | BaseModelOutputWithPooling:
+    ):
         return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
     def get_image_features(
@@ -1219,10 +1256,8 @@ class Qwen3_5Model(nn.Module):
         image_grid_thw: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
-        pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(
-            pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
-        )
+        pixel_values = pixel_values.type(self.visual.patch_embed.proj.weight.dtype)
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
 
@@ -1326,10 +1361,8 @@ class Qwen3_5Model(nn.Module):
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
         if pixel_values is not None:
-            image_outputs: BaseModelOutputWithPooling = self.get_image_features(
-                pixel_values, image_grid_thw, return_dict=True, **kwargs
-            )
-            image_embeds = image_outputs.pooler_output
+            # get_image_features 返回的是按图切好的 tuple,顺序与占位符出现顺序一致
+            image_embeds = self.get_image_features(pixel_values, image_grid_thw, **kwargs)
             image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
@@ -1337,10 +1370,7 @@ class Qwen3_5Model(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_outputs: BaseModelOutputWithPooling = self.get_video_features(
-                pixel_values_videos, video_grid_thw, return_dict=True, **kwargs
-            )
-            video_embeds = video_outputs.pooler_output
+            video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
             video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
@@ -1349,7 +1379,7 @@ class Qwen3_5Model(nn.Module):
 
         if position_ids is None:
             if pixel_values is not None or pixel_values_videos is not None:
-                # 视觉输入要用 3D 位置(暂时只在文本路径跑,这里保留原实现)
+                # Kavor 走这条路时 runner 总是显式传 3D 位置,这里是脱离引擎直接调模型时的兜底
                 position_ids = self.compute_3d_position_ids(
                     input_ids=input_ids,
                     image_grid_thw=image_grid_thw,
@@ -1387,6 +1417,31 @@ class Qwen3_5ForCausalLM(nn.Module):
         
         if config.text_config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.language_model.embed_tokens.weight.data
+
+    def mm_position_ids(self, seq) -> torch.LongTensor:
+        """一条多模态序列的 3-D mrope 位置 (3, N),顺便把 rope_delta 写回 seq.mm。
+
+        位置只由 token 序列本身决定(mm_token_type_ids 分段 + grid_thw),与 prefill 怎么切无关,
+        所以每次 prefill 重算就行(preempt 之后重跑也安全)。解码步要用 seq.mm.rope_delta:
+        图像那些 token 只占很少的位置(一张图的位置跨度是 max(H,W)/2),不加它位置就会一直偏大。
+        """
+        mm = seq.mm
+        # device="cpu" 写死:位置计算全程在 CPU 上做,不受全局默认设备影响
+        input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long, device="cpu")
+        mm_token_type_ids = torch.tensor([mm.mm_token_type_ids], dtype=torch.long, device="cpu")
+        # grid 一律搬回 CPU:get_rope_index 里 current_pos 会被 grid 的 device 带成张量,
+        # 之后和 CPU 上的 arange 相加就炸(CPU 上算位置也更省事)
+        image_grid_thw = None if mm.image_grid_thw is None else mm.image_grid_thw.cpu()
+        # get_rope_index 会原地改 video_grid_thw 的 T 维,传副本免得把 seq 上的张量改坏
+        video_grid_thw = None if mm.video_grid_thw is None else mm.video_grid_thw.cpu().clone()
+        positions, deltas = self.model.get_rope_index(
+            input_ids,
+            mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+        )
+        mm.rope_delta = int(deltas.flatten()[0])
+        return positions[:, 0]      # get_rope_index 返回 (3, batch, N),这里 batch=1
 
     def forward(
         self,

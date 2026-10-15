@@ -1,5 +1,6 @@
 import argparse
 import json
+import traceback
 
 
 def add_server_args(parser: argparse.ArgumentParser):
@@ -18,6 +19,10 @@ def add_server_args(parser: argparse.ArgumentParser):
         help="允许加载 tokenizer 时执行模型目录里的自定义代码。模型 config 由 Kavor 自己解析,不受此开关影响")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument(
+        "--mm-max-pixels", type=int, default=1280 * 28 * 28,
+        help="多模态请求里每张图(视频为每帧)的像素上限,超了会等比缩小;"
+             "不设上限时模型自己会用 16777216(打平正好 16384 个视觉 token,顶满 max-num-batched-tokens)")
+    parser.add_argument(
         "--default-chat-template-kwargs", type=json.loads, default=None,
         help='模板的默认变量(JSON),比如 \'{"enable_thinking": true}\'。'
              '请求里的 chat_template_kwargs 优先级更高')
@@ -35,8 +40,11 @@ def main(argv: list[str] | None = None):
         try:
             from kavor.interface.openai import api_server
         except ImportError as e:
-            raise SystemExit(
-                "serve 需要 fastapi/uvicorn,请执行: pip install kavor[serve]") from e
+            if e.name in ("fastapi", "uvicorn"):
+                raise SystemExit(
+                    f"serve 需要 {e.name},请执行: pip install kavor[serve]") from e
+            traceback.print_exc()
+            raise SystemExit(f"serve 代码导入失败: {type(e).__name__}: {e}") from e
         api_server.run(args)
     
 

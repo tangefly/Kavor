@@ -39,7 +39,7 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+            if remaining < num_tokens and (scheduled_seqs or seq.mm is not None):
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)

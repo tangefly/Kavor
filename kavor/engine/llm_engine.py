@@ -4,7 +4,7 @@ import signal
 from dataclasses import fields
 from time import monotonic, perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 import torch.multiprocessing as mp
 
 from kavor.config import Config
@@ -13,6 +13,7 @@ from kavor.engine.sequence import Sequence
 from kavor.engine.scheduler import Scheduler
 from kavor.engine.model_runner import ModelRunner
 from kavor.utils.logger import setup_logging
+from .multimodal import MultiModalInputs
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -49,6 +51,10 @@ class LLMEngine:
             self.model_runner = ModelRunner(config, 0, self.events)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 config.model, use_fast=True, trust_remote_code=config.trust_remote_code)
+            # 只有带视觉塔的模型才需要 processor,文本模型上 AutoProcessor 只会退化成 tokenizer
+            self.processor = (
+                AutoProcessor.from_pretrained(config.model, trust_remote_code=config.trust_remote_code)
+                if getattr(config, "vision_config", None) is not None else None)
             config.eos = self.tokenizer.eos_token_id
             self.scheduler = Scheduler(config)
         except BaseException:
@@ -89,10 +95,35 @@ class LLMEngine:
                 p.kill()
                 p.join(timeout=2.0)
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams) -> int:
-        if isinstance(prompt, str):
+    def build_mm_inputs(self, messages: list[dict], max_pixels: int | None = None,
+                        **template_kwargs) -> MultiModalInputs:
+        """OpenAI 风格 messages(带图/视频) → MultiModalInputs,可以直接喂给 generate。
+
+        例:llm.build_mm_inputs([{"role": "user", "content": [
+                {"type": "image", "image": Image.open(path)}, {"type": "text", "text": "描述这张图"}]}])
+        """
+        assert self.processor is not None, (
+            f"{self.config.model} 没有 processor(AutoProcessor),不支持多模态输入")
+        return MultiModalInputs.build_mm_inputs(
+            self.tokenizer, self.processor, messages, max_pixels=max_pixels, **template_kwargs)
+
+    def add_request(self, prompt: str | list[int] | MultiModalInputs,
+                    sampling_params: SamplingParams) -> int:
+        """prompt 可以是纯文本、已 tokenize 的 id 列表,或带多模态附件的 MultiModalInputs。"""
+        mm = prompt if isinstance(prompt, MultiModalInputs) else None
+        if mm is not None:
+            # token_ids 已经由 processor 展开过占位符,不能再 tokenize 一遍
+            assert self.config.tensor_parallel_size == 1, "多模态输入目前只支持单卡"
+            if len(mm.token_ids) > self.config.max_num_batched_tokens:
+                raise ValueError(
+                    f"多模态 prompt 有 {len(mm.token_ids)} 个 token,超过 max_num_batched_tokens"
+                    f"({self.config.max_num_batched_tokens}):多模态序列的 prefill 不切分,排不下就会一直等。"
+                    "调大 --max-num-batched-tokens,或用更小的图/更少的帧")
+            prompt = mm.token_ids
+        elif isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        seq.mm = mm
         self.scheduler.add(seq)
         return seq.seq_id
 
@@ -116,7 +147,7 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: list[str] | list[list[int]] | list[MultiModalInputs],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
