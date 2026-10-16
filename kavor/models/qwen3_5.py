@@ -21,10 +21,7 @@ from kavor.utils.context import get_context
 from kavor.utils.mm_plan import plan_shards
 
 from transformers.activations import ACT2FN
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.processing_utils import Unpack
 from transformers.utils import (
-    TransformersKwargs,
     is_torchdynamo_exporting,
     torch_compilable_check,
 )
@@ -408,11 +405,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.states: dict[int, tuple[torch.Tensor, torch.Tensor, int]] = {}
 
     def _qkv_segment_sizes(self) -> tuple[int, int, int]:
-        """[q | k | v] 三段在**全局**张量里的宽度(in_proj_qkv 的行、conv1d 的通道同序)。"""
         return self.total_key_dim, self.total_key_dim, self.total_value_dim
 
     def qkv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        """拆 [q | k | v] 三段,分别交给 MergedColumnParallelLinear 的标准 loader 切本 rank 的头。"""
         offset = 0
         for shard_id, size in enumerate(self._qkv_segment_sizes()):
             MergedColumnParallelLinear.weight_loader(
@@ -420,7 +415,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             offset += size
 
     def conv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        """卷积权重 [conv_dim, 1, K]:偏移和 qkv_weight_loader 的段内偏移逐段对齐。"""
         pieces = []
         offset = 0
         for size in self._qkv_segment_sizes():
@@ -430,7 +424,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         param.data.copy_(torch.cat(pieces, dim=0))
 
     def v_head_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        """A_log / dt_bias:[total_num_v_heads] 每个 v 头一个标量,和 in_proj_z/b/a 的行同序。"""
         local = self.num_v_heads
         param.data.copy_(loaded_weight.narrow(0, self.tp_rank * local, local))
 
@@ -635,7 +628,7 @@ def eager_attention_forward(
     attention_mask: torch.Tensor | None,
     scaling: float,
     dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
+    **kwargs,
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
@@ -742,7 +735,7 @@ class Qwen3_5Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -1163,7 +1156,7 @@ class Qwen3_5Model(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.config = config        # get_rope_index 要用 config.vision_config.spatial_merge_size
+        self.config = config
         self.visual = Qwen3_5VisionModel(config.vision_config)
         self.language_model = Qwen3_5TextModel(config.text_config)
         self.rope_deltas = None 
@@ -1265,7 +1258,7 @@ class Qwen3_5Model(nn.Module):
         self,
         pixel_values_videos: torch.FloatTensor,
         video_grid_thw: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ):
         return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -1273,7 +1266,7 @@ class Qwen3_5Model(nn.Module):
         self,
         pixel_values: torch.FloatTensor,
         image_grid_thw: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ):
         pixel_values = pixel_values.type(self.visual.patch_embed.proj.weight.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
@@ -1400,9 +1393,7 @@ class Qwen3_5Model(nn.Module):
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
-        mm_token_type_ids: torch.IntTensor | None = None,
-        mm_present: bool = False,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ):
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1424,19 +1415,7 @@ class Qwen3_5Model(nn.Module):
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        if position_ids is None:
-            if pixel_values is not None or pixel_values_videos is not None or mm_present:
-                position_ids = self.compute_3d_position_ids(
-                    input_ids=input_ids,
-                    image_grid_thw=image_grid_thw,
-                    video_grid_thw=video_grid_thw,
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=None,
-                    past_key_values=None,
-                    mm_token_type_ids=mm_token_type_ids,
-                )
-            else:
-                position_ids = torch.arange(inputs_embeds.shape[0], device=inputs_embeds.device)
+        position_ids = torch.arange(inputs_embeds.shape[0], device=inputs_embeds.device)
 
         return self.language_model(
             position_ids=position_ids,
@@ -1491,7 +1470,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         mm_token_type_ids: torch.IntTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        **kwargs,
     ):
         hidden_states = self.model(
             input_ids=input_ids,

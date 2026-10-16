@@ -1,20 +1,9 @@
 from copy import copy
 from enum import Enum, auto
 from itertools import count
-import torch
-from dataclasses import dataclass
 
 from kavor.sampling_params import SamplingParams
 from .multimodal import MultiModalInputs
-
-@dataclass
-class MultiModalVisionData:
-    mm_token_type_ids: list[int] | None = None
-    pixel_values: torch.Tensor | None = None
-    image_grid_thw: torch.Tensor | None = None
-    pixel_values_videos: torch.Tensor | None = None
-    video_grid_thw: torch.Tensor | None = None
-    rope_delta: int = 0
 
 
 class SequenceStatus(Enum):
@@ -33,15 +22,11 @@ class Sequence:
         self.status = SequenceStatus.WAITING
         
         self.token_ids = copy(mm_inputs.token_ids)
-        self.mm = MultiModalVisionData(
-            mm_token_type_ids=mm_inputs.mm_token_type_ids,
-            pixel_values=mm_inputs.pixel_values,
-            image_grid_thw=mm_inputs.image_grid_thw,
-            pixel_values_videos=mm_inputs.pixel_values_videos,
-            video_grid_thw=mm_inputs.video_grid_thw,
-            rope_delta=mm_inputs.rope_delta
-        )
-        
+        # 整份多模态输入直接挂在 seq 上(浅拷贝:张量仍是同一块,但 rope_delta 是各自的)。
+        # 发给 TP worker 的那份由 __getstate__ 走 for_workers 裁掉像素张量——像素留在 rank0,
+        # 单独走 _scatter_mm 的 NCCL 数据面,塞进共享内存会撑爆。
+        self.mm = copy(mm_inputs)
+
         self.last_token = self.token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(self.token_ids)

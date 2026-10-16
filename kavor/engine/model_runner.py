@@ -5,6 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from kavor.config import Config
+from kavor.engine.multimodal import MultiModalInputs
 from kavor.engine.sequence import Sequence
 from kavor.layers.sampler import Sampler
 from kavor.utils.context import set_context, get_context, reset_context
@@ -110,7 +111,7 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
+        seqs = [Sequence(MultiModalInputs([0] * seq_len, "")) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
@@ -153,12 +154,7 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def _position_ids(self, seq: Sequence, start: int, end: int) -> torch.Tensor:
-        """一条序列在 [start, end) 上的 3-D 位置 (3, seqlen)。
-
-        多模态批次里所有序列都走 3-D:纯文本序列三条流相同,数学上和原来的 1-D 位置等价;
-        多模态序列由模型按 mm_token_type_ids 分段算,顺便把 rope_delta 写回 seq.mm(解码步要用)。
-        """
+    def position_ids(self, seq: Sequence, start: int, end: int) -> torch.Tensor:
         if seq.mm is None:
             return torch.arange(start, end).unsqueeze(0).expand(3, -1)
         return self.model.mm_position_ids(seq)[:, start:end]
@@ -167,7 +163,7 @@ class ModelRunner:
         mm_seqs = [seq for seq in seqs if seq.mm is not None]
         if not mm_seqs:
             return {}
-        kwargs = {"mm_present": True}
+        kwargs = {}
         for pixel_key, grid_key in (("pixel_values", "image_grid_thw"),
                                     ("pixel_values_videos", "video_grid_thw")):
             grids = [getattr(seq.mm, grid_key) for seq in mm_seqs
@@ -225,7 +221,7 @@ class ModelRunner:
             seqlen_k = end
             input_ids.extend(seq[start:end])
             if has_mm:
-                positions.append(self._position_ids(seq, start, end))
+                positions.append(self.position_ids(seq, start, end))
             else:
                 positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -304,8 +300,8 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         mm_kwargs = self.prepare_mm_inputs(seqs) if is_prefill else {}
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill, mm_kwargs)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

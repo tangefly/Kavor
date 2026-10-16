@@ -32,8 +32,7 @@ class MultiModalInputs:
     image_grid_thw: torch.Tensor | None = None
     pixel_values_videos: torch.Tensor | None = None
     video_grid_thw: torch.Tensor | None = None
-    rope_delta: int = 0
-
+    rope_delta: int = 0                             # prefill 时由模型回填,解码步的位置要加它
     def for_workers(self, prefill: bool) -> "MultiModalInputs":
         if prefill:
             return MultiModalInputs(
