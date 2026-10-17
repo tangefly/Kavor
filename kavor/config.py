@@ -5,12 +5,7 @@ from dataclasses import dataclass
 from kavor.models.configuration_auto import AutoConfig
 
 
-def _free_port() -> int:
-    """随便要一个空闲端口:分配完就关掉,真正 bind 的是后面 NCCL 的 rendezvous。
-
-    以前这里写死 43781,同一台机器上跑第二个 Kavor 进程(比如一边 serve 一边跑 examples)
-    就会 EADDRINUSE。多机多卡要固定端口时用 KAVOR_RDZV_PORT 覆盖。
-    """
+def free_port() -> int:
     if env := os.environ.get("KAVOR_RDZV_PORT"):
         return int(env)
     with socket.socket() as s:
@@ -34,17 +29,17 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
-    rdzv_port: int = -1                 # NCCL rendezvous 端口,见 _free_port
+    rdzv_port: int = -1
+    has_linear_attention: bool = False
+    num_linear_state_groups: int = 0
 
     def __post_init__(self):
         if not os.path.isdir(self.model):
             raise RuntimeError(f"Model not found: {self.model}")
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
-        # 在父进程里挑好,worker 直接复用同一份 config,所以天生一致
-        self.rdzv_port = self.rdzv_port if self.rdzv_port > 0 else _free_port()
+        self.rdzv_port = self.rdzv_port if self.rdzv_port > 0 else free_port()
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        # 文本模型的 config 里根本没有 vision_config 这个字段,必须 getattr(Qwen3/Mistral/Ouro 都没有)
         if getattr(self.hf_config, "vision_config", None):
             self.text_config = self.hf_config.text_config
             self.vision_config = self.hf_config.vision_config

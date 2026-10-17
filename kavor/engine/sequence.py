@@ -22,9 +22,6 @@ class Sequence:
         self.status = SequenceStatus.WAITING
         
         self.token_ids = copy(mm_inputs.token_ids)
-        # 整份多模态输入直接挂在 seq 上(浅拷贝:张量仍是同一块,但 rope_delta 是各自的)。
-        # 发给 TP worker 的那份由 __getstate__ 走 for_workers 裁掉像素张量——像素留在 rank0,
-        # 单独走 _scatter_mm 的 NCCL 数据面,塞进共享内存会撑爆。
         self.mm = copy(mm_inputs)
 
         self.last_token = self.token_ids[-1]
@@ -35,6 +32,7 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+        self.state_block_ids: list[int] | None = None
         
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -85,10 +83,10 @@ class Sequence:
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         mm = None if self.mm is None else self.mm.for_workers(prefill=self.is_prefill)
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm, self.state_block_ids)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm = state
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm, self.state_block_ids = state
         self.mm = mm
         if isinstance(last_state, list):
             self.token_ids = last_state

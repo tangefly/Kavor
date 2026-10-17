@@ -1,15 +1,3 @@
-"""把 OpenAI 风格的消息内容变成模型的可用输入(processor 那一套)。
-
-链路:content 里的媒体项 → 取字节(URL/base64 → PIL/帧) → chat 模板渲染占位符
-     → processor 展开占位符 + 打包像素 → MultiModalInputs。
-
-两条容易踩的约束,代码里都显式拦了:
-- 模板(chat_template.jinja)只认 'image'/'image_url'/type=='image' 和 'video'/type=='video',
-  vLLM 的 type='video_url' 一个都不命中会直接 raise,必须在 normalize_content 里洗掉;
-- 占位符和 images 是**按出现顺序**一一对应的,数量对不上时 processor 不报错(静默丢图),
-  所以要自己校验。
-"""
-
 from dataclasses import dataclass
 import base64
 import io

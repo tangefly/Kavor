@@ -12,7 +12,10 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks, config.kvcache_block_size,
+            has_linear_attention=config.has_linear_attention,
+            num_state_groups=config.num_linear_state_groups)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 

@@ -286,9 +286,6 @@ def torch_recurrent_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Computes linear attention using the gated delta rule, by iterating over each token in the sequence dimension.
-    Same args and return value as torch_chunk_gated_delta_rule, except for `chunk_size` because the sequence dim is not
-    chunked."""
     initial_dtype = query.dtype
     batch_size, sequence_length, _, k_head_dim = key.shape
     num_v_heads, v_head_dim = value.shape[-2:]
@@ -402,7 +399,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj_z = ColumnParallelLinear(self.hidden_size, self.total_value_dim, bias=False)
         self.in_proj_b = ColumnParallelLinear(self.hidden_size, self.total_num_v_heads, bias=False)
         self.in_proj_a = ColumnParallelLinear(self.hidden_size, self.total_num_v_heads, bias=False)
-        self.states: dict[int, tuple[torch.Tensor, torch.Tensor, int]] = {}
+
+        self.state_shapes = (
+            (self.conv_dim, self.conv_kernel_size - 1),
+            (self.num_v_heads, self.head_k_dim, self.head_v_dim),
+        )
+        self.state_dtypes = (self.conv1d.weight.dtype, torch.float32)
+        self.state_group = 0
+        self.register_buffer("conv_pool", torch.empty(0), persistent=False)
+        self.register_buffer("recurrent_pool", torch.empty(0), persistent=False)
 
     def _qkv_segment_sizes(self) -> tuple[int, int, int]:
         return self.total_key_dim, self.total_key_dim, self.total_value_dim
@@ -427,17 +432,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         local = self.num_v_heads
         param.data.copy_(loaded_weight.narrow(0, self.tp_rank * local, local))
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        linear_state_keys: list[int] | None = None,
-        **kwargs,
-    ) -> torch.Tensor:
+    def _slot_ids(self) -> torch.Tensor:
+        slot_ids = get_context().linear_slot_ids
+        assert slot_ids is not None, (
+            "线性注意力层需要序列的状态块 id(linear_slot_ids),但 context 里没有:"
+            "序列进模型之前要先经过调度器的块分配")
+        return slot_ids[:, self.state_group]
 
-        assert linear_state_keys is not None, "线性注意力层需要序列身份(linear_state_keys)"
-        if get_context().is_prefill:
-            return self._prefill(hidden_states, linear_state_keys)
-        return self._decode(hidden_states, linear_state_keys)
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        if get_context().isprefill:
+            return self.prefill(hidden_states)
+        return self.decode(hidden_states)
 
     def _beta_g(self, hidden_states: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
         a = self.in_proj_a(hidden_states).view(-1, seq_len, self.num_v_heads)
@@ -478,25 +483,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
         return self.out_proj(core_attn_out)
 
-    def _prefill(self, hidden_states: torch.Tensor, keys: list[int]) -> torch.Tensor:
+    def prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_context()
+        slot_ids = self._slot_ids().tolist()
         cu_seqlens_q = context.cu_seqlens_q.tolist()
         cu_seqlens_k = context.cu_seqlens_k.tolist()
         kernel_size = self.conv_kernel_size - 1
         outputs = []
-        for i, key in enumerate(keys):
+        for i, slot in enumerate(slot_ids):
             q_start, q_end = cu_seqlens_q[i], cu_seqlens_q[i + 1]
             seq_len = q_end - q_start
-            # 线性层的状态是整段前缀的函数,没法从 KV cache 中间"续"起来
             start = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]) - seq_len
             assert start == 0, (
                 f"第 {i} 条序列从第 {start} 个 token 开始,说明它复用了 KV cache(prefix cache 命中)"
-                "或被切块调度,这两种情况下线性注意力的状态无法恢复。请关掉 prefix cache。"
+                "或被切块调度,这两种情况下线性注意力的状态无法恢复。"
+                "线性模型的 prefix cache 已在 BlockManager 里关掉;如果仍然触发,检查 max_num_batched_tokens "
+                "是否小于 prompt 长度(切块 prefill 目前不支持线性层)。"
             )
 
             x = hidden_states[q_start:q_end].unsqueeze(0)                    # [1, T, hidden]
             mixed_qkv = self.in_proj_qkv(x).transpose(1, 2)                  # [1, conv_dim, T],卷积前的值
-            # 卷积状态 = 末尾 k-1 列原始值(不足就左边补零,和卷积的零填充对齐)
             conv_state = mixed_qkv[:, :, -kernel_size:]
             if conv_state.shape[-1] < kernel_size:
                 conv_state = F.pad(conv_state, (kernel_size - conv_state.shape[-1], 0))
@@ -521,33 +527,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
-            self.states[key] = (conv_state[0].contiguous(), last_recurrent_state[0].contiguous(), seq_len)
+            self.conv_pool[slot] = conv_state[0]
+            self.recurrent_pool[slot] = last_recurrent_state[0]
             outputs.append(self._finalize(core_attn_out, z, 1, seq_len)[0])
 
         return torch.cat(outputs, dim=0)
 
-    def _decode(self, hidden_states: torch.Tensor, keys: list[int]) -> torch.Tensor:
-        context = get_context()
-        context_lens = context.context_lens.tolist()
-
-        # decode 步的 batch 就是全部 running 序列,这一步没出现的序列(已结束/被抢占/prefix cache 复用)可以清掉
-        live_keys = set(keys)
-        for key in list(self.states.keys()):
-            if key not in live_keys:
-                del self.states[key]
-
-        conv_states, recurrent_states = [], []
-        for i, key in enumerate(keys):
-            state = self.states.get(key)
-            assert state is not None, f"找不到序列状态(key={key}):这条序列没有经过 prefill?"
-            assert state[2] == context_lens[i] - 1, (
-                f"序列状态错位(key={key}):状态停在第 {state[2]} 个 token,"
-                f"而这一步要处理的是第 {context_lens[i] - 1} 个 token。"
-            )
-            conv_states.append(state[0])
-            recurrent_states.append(state[1])
-
-        conv_states = torch.stack(conv_states)                               # [B, conv_dim, k-1],就地更新
+    def decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        slot_ids = self._slot_ids()                                          # [B] 本组的状态块 id
+        conv_states = self.conv_pool[slot_ids]                               # [B, conv_dim, k-1]
         mixed_qkv = self.in_proj_qkv(hidden_states).unsqueeze(1).transpose(1, 2)    # [B, conv_dim, 1]
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -556,6 +544,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.conv1d.bias,
             self.activation,
         ).transpose(1, 2)
+        self.conv_pool[slot_ids] = conv_states
 
         query, key_states, value = self._split_qkv(mixed_qkv)
         z = self.in_proj_z(hidden_states).reshape(-1, 1, self.num_v_heads, self.head_v_dim)
@@ -567,18 +556,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             value,
             g=g,
             beta=beta,
-            initial_state=torch.stack(recurrent_states),
+            initial_state=self.recurrent_pool[slot_ids],
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
         )
-        for i, key in enumerate(keys):
-            self.states[key] = (
-                conv_states[i].contiguous(),
-                last_recurrent_states[i].contiguous(),
-                context_lens[i],
-            )
+        self.recurrent_pool[slot_ids] = last_recurrent_states
 
-        return self._finalize(core_attn_out, z, len(keys), 1)[:, 0]
+        return self._finalize(core_attn_out, z, slot_ids.numel(), 1)[:, 0]
 
 
 def rotate_half(x):
@@ -659,15 +643,12 @@ class Qwen3_5MRotaryEmbedding(nn.Module):
     def forward(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor):
         if positions.dim() == 1:    # 纯文本:三条流相同
             positions = positions.unsqueeze(0).expand(3, -1)
+        
         freqs = positions.float()[:, :, None] * self.inv_freq[None, None, :]
-        n_freq = self.inv_freq.numel()
-        cos = torch.empty(positions.shape[1], 1, n_freq, dtype=torch.float32, device=positions.device)
-        sin = torch.empty_like(cos)
-        for row in range(3):
-            sel = self.freq_row == row
-            f = freqs[row][:, sel]
-            cos[:, 0, sel] = f.cos()
-            sin[:, 0, sel] = f.sin()
+        picked = freqs[0]
+        for row in (1, 2):
+            picked = torch.where(self.freq_row == row, freqs[row], picked)
+        cos, sin = picked.cos().unsqueeze(1), picked.sin().unsqueeze(1)
         return apply_rotary_emb(query, cos, sin), apply_rotary_emb(key, cos, sin)
 
 
@@ -833,7 +814,6 @@ class Qwen3_5DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.LongTensor,
-        linear_state_keys: list[int] | None = None,
     ) -> torch.FloatTensor:
         residual = hidden_states
 
@@ -841,7 +821,7 @@ class Qwen3_5DecoderLayer(nn.Module):
 
         # Token Mixer
         if self.block_type == "linear_attention":
-            hidden_states = self.linear_attn(hidden_states, linear_state_keys=linear_state_keys)
+            hidden_states = self.linear_attn(hidden_states)
         elif self.block_type == "full_attention":
             # Self Attention
             hidden_states = self.self_attn(hidden_states, position_ids=position_ids)
@@ -1104,23 +1084,7 @@ class Qwen3_5TextModel(nn.Module):
         )
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.has_linear_attention = any(t == "linear_attention" for t in config.layer_types)
-
-    def linear_state_keys(self) -> list[int] | None:
-        context = get_context()
-        block_size = self._kv_block_size()
-        if context.is_prefill:
-            cu_seqlens_q = context.cu_seqlens_q.tolist()
-            slot_mapping = context.slot_mapping.tolist()
-            return [slot_mapping[start] // block_size for start in cu_seqlens_q[:-1]]
-        return context.block_tables[:, 0].tolist()
-
-    def _kv_block_size(self) -> int:
-        for layer in self.layers:
-            if layer.block_type == "full_attention":
-                k_cache = layer.self_attn.attn.k_cache[0]
-                if k_cache.numel():
-                    return k_cache.shape[1]
-        raise RuntimeError("KV cache 还没分配,无法推出 block 大小")
+        self.linear_padding_slot: int | None = None
 
     def forward(
         self,
@@ -1134,15 +1098,11 @@ class Qwen3_5TextModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # 线性注意力层需要"每条序列是谁",一步算一次(只在这里做一次 GPU->CPU 同步)
-        keys = self.linear_state_keys() if self.has_linear_attention else None
-
         hidden_states = inputs_embeds
         for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 hidden_states,
                 position_ids=position_ids,
-                linear_state_keys=keys,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -1445,6 +1405,15 @@ class Qwen3_5ForCausalLM(nn.Module):
     @property
     def mm_pixel_dtype(self):
         return self.model.visual.patch_embed.proj.weight.dtype
+
+    @property
+    def linear_padding_slot(self) -> int | None:
+        """线性注意力状态池的占位块 id(模型没有线性注意力层时为 None),见 Qwen3_5TextModel。"""
+        return self.model.language_model.linear_padding_slot
+
+    @linear_padding_slot.setter
+    def linear_padding_slot(self, value: int | None):
+        self.model.language_model.linear_padding_slot = value
 
     def mm_position_ids(self, seq) -> torch.LongTensor:
         mm = seq.mm
