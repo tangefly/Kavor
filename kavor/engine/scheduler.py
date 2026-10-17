@@ -36,7 +36,7 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
+                num_cached_blocks = self.block_manager.can_allocate_prefill(seq)
                 if num_cached_blocks == -1:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
@@ -45,7 +45,7 @@ class Scheduler:
             if remaining < num_tokens and (scheduled_seqs or seq.mm is not None):
                 break
             if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
+                self.block_manager.allocate_prefill(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -60,7 +60,8 @@ class Scheduler:
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            # 如果 seq 不够 block，就从后面的 seq 抢占
+            while not self.block_manager.can_append_block(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -69,7 +70,7 @@ class Scheduler:
             else:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append_block(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))

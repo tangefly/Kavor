@@ -69,26 +69,28 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
-        h = -1
+    def can_allocate_prefill(self, seq: Sequence) -> int:        
+        hash_id = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
+        # prefix caching
         if self.enable_prefix_cache and seq.mm is None:
             for i in range(seq.num_blocks - 1):
                 token_ids = seq.block(i)
-                h = self.compute_hash(token_ids, h)
-                block_id = self.hash_to_block_id.get(h, -1)
+                hash_id = self.compute_hash(token_ids, hash_id)
+                block_id = self.hash_to_block_id.get(hash_id, -1)
                 if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                     break
                 num_cached_blocks += 1
                 if block_id in self.used_block_ids:
                     num_new_blocks -= 1
         num_new_blocks += self.num_state_groups
+        # lack of enough blocks for prefill
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks
 
-    def allocate(self, seq: Sequence, num_cached_blocks: int):
+    def allocate_prefill(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
         h = -1
         for i in range(num_cached_blocks):
@@ -124,10 +126,10 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
+    def can_append_block(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
-    def may_append(self, seq: Sequence):
+    def may_append_block(self, seq: Sequence):
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self.allocate_block())
 

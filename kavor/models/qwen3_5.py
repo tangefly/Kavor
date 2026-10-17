@@ -440,7 +440,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return slot_ids[:, self.state_group]
 
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
-        if get_context().isprefill:
+        if get_context().is_prefill:
             return self.prefill(hidden_states)
         return self.decode(hidden_states)
 
