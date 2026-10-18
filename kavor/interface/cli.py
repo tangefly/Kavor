@@ -13,7 +13,7 @@ def add_server_args(parser: argparse.ArgumentParser):
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--enforce-eager", action="store_false")
+    parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
         "--trust-remote-code", action="store_true",
         help="允许加载 tokenizer 时执行模型目录里的自定义代码。模型 config 由 Kavor 自己解析,不受此开关影响")
