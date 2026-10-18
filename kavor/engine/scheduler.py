@@ -42,7 +42,7 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and (scheduled_seqs or seq.mm is not None):
+            if remaining < num_tokens and (scheduled_seqs or seq.is_multimodal):
                 break
             if not seq.block_table:
                 self.block_manager.allocate_prefill(seq, num_cached_blocks)

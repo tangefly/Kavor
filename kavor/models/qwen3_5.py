@@ -1416,18 +1416,18 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.model.language_model.linear_padding_slot = value
 
     def mm_position_ids(self, seq) -> torch.LongTensor:
-        mm = seq.mm
+        inputs = seq.inputs
         input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long, device="cpu")
-        mm_token_type_ids = torch.tensor([mm.mm_token_type_ids], dtype=torch.long, device="cpu")
-        image_grid_thw = None if mm.image_grid_thw is None else mm.image_grid_thw.cpu()
-        video_grid_thw = None if mm.video_grid_thw is None else mm.video_grid_thw.cpu().clone()
+        mm_token_type_ids = torch.tensor([inputs.mm_token_type_ids], dtype=torch.long, device="cpu")
+        image_grid_thw = None if inputs.image_grid_thw is None else inputs.image_grid_thw.cpu()
+        video_grid_thw = None if inputs.video_grid_thw is None else inputs.video_grid_thw.cpu().clone()
         positions, deltas = self.model.get_rope_index(
             input_ids,
             mm_token_type_ids,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
         )
-        mm.rope_delta = int(deltas.flatten()[0])
+        inputs.rope_delta = int(deltas.flatten()[0])
         return positions[:, 0]
 
     def forward(

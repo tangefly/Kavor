@@ -46,7 +46,7 @@ def main():
     prompts = []
     for messages in requests:
         if isinstance(messages[0]["content"], list):
-            prompts.append(llm.build_mm_inputs(messages, max_pixels=args.max_pixels))
+            prompts.append(llm.build_inputs(messages, max_pixels=args.max_pixels))
         else:
             prompts.append(llm.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True))

@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from kavor.config import Config
 from kavor.engine.cache_pool import CachePool
-from kavor.engine.multimodal import MultiModalInputs
+from kavor.engine.multimodal import ModalInputs
 from kavor.engine.sequence import Sequence
 from kavor.layers.sampler import Sampler
 from kavor.utils.context import set_context, get_context, reset_context
@@ -95,7 +95,7 @@ class ModelRunner:
             raise RuntimeError(
                 f"要发给 TP worker 的数据有 {n / 2**20:.1f} MB,超过共享内存 "
                 f"{len(self.shm.buf) / 2**20:.0f} MB:args 里不要夹带大张量"
-                "(多模态的像素张量应该在 MultiModalInputs.for_workers 里就被丢掉,"
+                "(多模态的像素张量应该在 ModalInputs.for_workers 里就被丢掉,"
                 "改走 _scatter_mm 那条 NCCL 数据面)")
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
@@ -114,7 +114,7 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence(MultiModalInputs([0] * seq_len, "")) for _ in range(num_seqs)]
+        seqs = [Sequence(ModalInputs([0] * seq_len, "")) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs, True)
@@ -223,7 +223,7 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
-        has_mm = any(seq.mm is not None for seq in seqs)
+        has_mm = any(seq.is_multimodal for seq in seqs)
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
@@ -273,7 +273,7 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1 + (seq.mm.rope_delta if seq.mm is not None else 0))
+            positions.append(len(seq) - 1 + (seq.inputs.rope_delta if seq.inputs is not None else 0))
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -293,23 +293,23 @@ class ModelRunner:
         return block_tables
 
     def position_ids(self, seq: Sequence, start: int, end: int) -> torch.Tensor:
-        if seq.mm is None:
-            return torch.arange(start, end).unsqueeze(0).expand(3, -1)
-        return self.model.mm_position_ids(seq)[:, start:end]
+        if seq.is_multimodal:
+            return self.model.mm_position_ids(seq)[:, start:end] 
+        return torch.arange(start, end).unsqueeze(0).expand(3, -1)
 
     def prepare_mm_inputs(self, seqs: list[Sequence]) -> dict:
-        mm_seqs = [seq for seq in seqs if seq.mm is not None]
+        mm_seqs = [seq for seq in seqs if seq.is_multimodal]
         if not mm_seqs:
             return {}
         kwargs = {}
         for pixel_key, grid_key in (("pixel_values", "image_grid_thw"),
                                     ("pixel_values_videos", "video_grid_thw")):
-            grids = [getattr(seq.mm, grid_key) for seq in mm_seqs
-                     if getattr(seq.mm, grid_key) is not None]
+            grids = [getattr(seq.inputs, grid_key) for seq in mm_seqs
+                     if getattr(seq.inputs, grid_key) is not None]
             if not grids:
                 continue
-            pixels = [getattr(seq.mm, pixel_key) for seq in mm_seqs
-                      if getattr(seq.mm, pixel_key) is not None]
+            pixels = [getattr(seq.inputs, pixel_key) for seq in mm_seqs
+                      if getattr(seq.inputs, pixel_key) is not None]
             kwargs[grid_key] = torch.cat(grids, dim=0).cuda(non_blocking=True)
             kwargs[pixel_key] = self._scatter_mm(pixels, kwargs[grid_key])
         return kwargs

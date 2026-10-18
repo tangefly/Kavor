@@ -14,7 +14,7 @@ from kavor.engine.sequence import Sequence
 from kavor.engine.scheduler import Scheduler
 from kavor.engine.model_runner import ModelRunner
 from kavor.utils.logger import setup_logging
-from .multimodal import MultiModalInputs
+from .multimodal import ModalInputs
 
 logger = logging.getLogger(__name__)
 
@@ -95,24 +95,24 @@ class LLMEngine:
                 p.kill()
                 p.join(timeout=2.0)
 
-    def build_mm_inputs(self, messages: list[dict], max_pixels: int | None = None,
-                        **template_kwargs) -> MultiModalInputs:
+    def build_inputs(self, messages: list[dict], max_pixels: int | None = None,
+                     **template_kwargs) -> ModalInputs:
         assert self.processor is not None, (
             f"{self.config.model} 没有 processor(AutoProcessor),不支持多模态输入")
-        return MultiModalInputs.build_mm_inputs(
+        return ModalInputs.build_inputs(
             self.tokenizer, self.processor, messages, max_pixels=max_pixels, **template_kwargs)
 
     def add_request(
-        self, 
-        mm_input: MultiModalInputs,
+        self,
+        inputs: ModalInputs,
         sampling_params: SamplingParams
     ) -> int:
-        if len(mm_input.token_ids) > self.config.max_num_batched_tokens:
+        if len(inputs.token_ids) > self.config.max_num_batched_tokens:
             raise ValueError(
-                f"多模态 prompt 有 {len(mm_input.token_ids)} 个 token,超过 max_num_batched_tokens"
+                f"prompt 有 {len(inputs.token_ids)} 个 token,超过 max_num_batched_tokens"
                 f"({self.config.max_num_batched_tokens}):多模态序列的 prefill 不切分,排不下就会一直等。"
                 "调大 --max-num-batched-tokens,或用更小的图/更少的帧")
-        seq = Sequence(mm_input, sampling_params)
+        seq = Sequence(inputs, sampling_params)
         self.scheduler.add(seq)
         return seq.seq_id
 
@@ -136,40 +136,40 @@ class LLMEngine:
     
     def normalize_input(
         self, 
-        inputs: list[str] | list[list[int]] | list[MultiModalInputs]
-    ) -> list[MultiModalInputs]:
-        mm_inputs = []
-        for input in inputs:
-            if isinstance(input, MultiModalInputs):
-                mm_inputs.append(input)
-            elif isinstance(input, str):
-                token_ids = self.tokenizer.encode(input)
-                mm_inputs.append(MultiModalInputs(token_ids, input))
-            elif isinstance(input, int):
-                mm_inputs.append(MultiModalInputs(torch.tensor(input), None))
+        inputs: list[str] | list[list[int]] | list[ModalInputs]
+    ) -> list[ModalInputs]:
+        normalized = []
+        for item in inputs:
+            if isinstance(item, ModalInputs):
+                normalized.append(item)
+            elif isinstance(item, str):
+                token_ids = self.tokenizer.encode(item)
+                normalized.append(ModalInputs(token_ids, item))
+            elif isinstance(item, int):
+                normalized.append(ModalInputs(torch.tensor(item), None))
             else:
                 raise RuntimeError("Not supported data type!")
-        return mm_inputs
+        return normalized
 
     def generate(
         self,
-        inputs: list[str] | list[list[int]] | list[MultiModalInputs],
+        inputs: list[str] | list[list[int]] | list[ModalInputs],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
         
-        mm_inputs = self.normalize_input(inputs)
+        inputs = self.normalize_input(inputs)
         if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(mm_inputs)
-        for mm_input, sp in zip(mm_inputs, sampling_params):
-            self.add_request(mm_input, sp)
+            sampling_params = [sampling_params] * len(inputs)
+        for item, sp in zip(inputs, sampling_params):
+            self.add_request(item, sp)
         
         outputs = {}
         
         prefill_throughput = 0.
         decode_throughput = 0.
         
-        pbar = tqdm(total=len(mm_inputs), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        pbar = tqdm(total=len(inputs), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()

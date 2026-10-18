@@ -11,7 +11,7 @@ from PIL import Image
 MAX_IMAGE_BYTES = 32 * 2**20
 
 @dataclass
-class MultiModalInputs:
+class ModalInputs:
 
     token_ids: list[int]
     prompt: str
@@ -21,9 +21,9 @@ class MultiModalInputs:
     pixel_values_videos: torch.Tensor | None = None
     video_grid_thw: torch.Tensor | None = None
     rope_delta: int = 0                             # prefill 时由模型回填,解码步的位置要加它
-    def for_workers(self, prefill: bool) -> "MultiModalInputs":
+    def for_workers(self, prefill: bool) -> "ModalInputs":
         if prefill:
-            return MultiModalInputs(
+            return ModalInputs(
                 token_ids=[],
                 prompt="",
                 mm_token_type_ids=self.mm_token_type_ids,
@@ -31,40 +31,49 @@ class MultiModalInputs:
                 video_grid_thw=self.video_grid_thw,
                 rope_delta=self.rope_delta,
             )
-        return MultiModalInputs(token_ids=[], prompt="", rope_delta=self.rope_delta)
+        return ModalInputs(token_ids=[], prompt="", rope_delta=self.rope_delta)
 
     @classmethod
-    def build_mm_inputs(
+    def build_inputs(
         cls,
         tokenizer,
         processor,
         messages: list[dict],
         max_pixels: int | None = None,
         **template_kwargs,
-    ) -> "MultiModalInputs":
+    ) -> "ModalInputs":
         """messages 是 OpenAI 风格的原始消息(可以混着 str 和 list 两种 content)。
         template_kwargs 直接转给 apply_chat_template(比如 tools=...)。
         """
         messages, images, videos = normalize_content(messages)
-        prompt = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, **template_kwargs)
-        inputs = processor(
-            text=prompt,
-            images=images or None,
-            videos=videos or None,
-            return_tensors="pt",
-            **({"images_kwargs": {"max_pixels": max_pixels}} if max_pixels else {}),
-        )
-        _check_placeholders(inputs, processor, len(images), len(videos))
-        return cls(
-            token_ids=inputs["input_ids"][0].tolist(),
-            prompt=prompt,
-            mm_token_type_ids=inputs["mm_token_type_ids"][0].tolist(),
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            pixel_values_videos=inputs.get("pixel_values_videos"),
-            video_grid_thw=inputs.get("video_grid_thw"),
-        )
+        if processor:
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, **template_kwargs)
+            inputs = processor(
+                text=prompt,
+                images=images or None,
+                videos=videos or None,
+                return_tensors="pt",
+                **({"images_kwargs": {"max_pixels": max_pixels}} if max_pixels else {}),
+            )
+            _check_placeholders(inputs, processor, len(images), len(videos))
+            return cls(
+                token_ids=inputs["input_ids"][0].tolist(),
+                prompt=prompt,
+                mm_token_type_ids=inputs["mm_token_type_ids"][0].tolist(),
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                pixel_values_videos=inputs.get("pixel_values_videos"),
+                video_grid_thw=inputs.get("video_grid_thw"),
+            )
+        else:
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, **template_kwargs)
+            inputs = tokenizer(prompt, return_tensors="pt")
+            return cls(
+                token_ids=inputs["input_ids"][0].tolist(),
+                prompt=prompt,
+            )
 
 
 def _content_of(message):

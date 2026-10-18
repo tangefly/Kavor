@@ -3,7 +3,7 @@ from enum import Enum, auto
 from itertools import count
 
 from kavor.sampling_params import SamplingParams
-from .multimodal import MultiModalInputs
+from .multimodal import ModalInputs
 
 
 class SequenceStatus(Enum):
@@ -16,13 +16,13 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, mm_inputs: MultiModalInputs, sampling_params = SamplingParams()):
-        
+    def __init__(self, inputs: ModalInputs, sampling_params = SamplingParams()):
+
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
-        
-        self.token_ids = copy(mm_inputs.token_ids)
-        self.mm = copy(mm_inputs)
+
+        self.token_ids = copy(inputs.token_ids)
+        self.inputs = copy(inputs)
 
         self.last_token = self.token_ids[-1]
         self.num_tokens = len(self.token_ids)
@@ -70,6 +70,16 @@ class Sequence:
     @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
+    
+    @property
+    def is_multimodal(self):
+        inputs = self.inputs
+        if inputs is None:
+            return False
+        if (inputs.pixel_values is not None or inputs.pixel_values_videos is not None
+                or inputs.image_grid_thw is not None or inputs.video_grid_thw is not None):
+            return True
+        return bool(inputs.mm_token_type_ids) and any(inputs.mm_token_type_ids)
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
@@ -82,12 +92,12 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        mm = None if self.mm is None else self.mm.for_workers(prefill=self.is_prefill)
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm, self.state_block_ids)
+        inputs = None if self.inputs is None else self.inputs.for_workers(prefill=self.is_prefill)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, inputs, self.state_block_ids)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm, self.state_block_ids = state
-        self.mm = mm
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, inputs, self.state_block_ids = state
+        self.inputs = inputs
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

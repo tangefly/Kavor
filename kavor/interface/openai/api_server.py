@@ -13,7 +13,7 @@ from kavor.engine.async_engine import AsyncEngine
 from kavor.interface.cli import add_server_args
 from kavor.sampling_params import SamplingParams
 from kavor.interface.parser.factory import *
-from kavor.engine.multimodal import MultiModalInputs, has_media
+from kavor.engine.multimodal import ModalInputs
 
 from .request import *
 from .response import *
@@ -138,26 +138,16 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
             **(getattr(app.state.args, "default_chat_template_kwargs", None) or {}),
             **(req.chat_template_kwargs or {}),
         }
-        if has_media(req.messages):
-            # 多模态分支:processor 直接产出 token_ids(占位符已按 grid 展开)和像素张量,
-            # 这里渲染出来的 prompt 只用来给 parser 判断输出状态。
-            prompt = MultiModalInputs.build_mm_inputs(
-                app.state.engine.tokenizer,
-                app.state.engine.processor,
-                messages,
-                max_pixels=getattr(app.state.args, "mm_max_pixels", None),
-                tools=req.tools,
-                **template_kwargs,
-            )
-            parsed_prompt = prompt.prompt
-        else:
-            prompt = parsed_prompt = app.state.engine.tokenizer.apply_chat_template(
-                messages,
-                tools=req.tools,
-                tokenize=False,
-                add_generation_prompt=True,
-                **template_kwargs,
-            )
+        
+        prompt = ModalInputs.build_inputs(
+            app.state.engine.tokenizer,
+            app.state.engine.processor,
+            messages,
+            max_pixels=getattr(app.state.args, "mm_max_pixels", None),
+            tools=req.tools,
+            **template_kwargs,
+        )
+        parsed_prompt = prompt.prompt
 
         queue = await app.state.engine.add_request(
             request_id, prompt, to_sampling_params(req, app.state.args))

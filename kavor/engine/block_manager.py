@@ -74,7 +74,7 @@ class BlockManager:
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
         # prefix caching
-        if self.enable_prefix_cache and seq.mm is None:
+        if self.enable_prefix_cache and not seq.is_multimodal:
             for i in range(seq.num_blocks - 1):
                 token_ids = seq.block(i)
                 hash_id = self.compute_hash(token_ids, hash_id)
