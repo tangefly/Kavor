@@ -36,13 +36,54 @@ class CachePool:
 
     # plan and allocate
 
-    def allocate(self) -> CacheLayout:
-        """Plan the layout, allocate the page pool, and bind it to the model.
+    def plan(self, reserve: int = 0, num_blocks: int | None = None) -> CacheLayout:
+        # model config
+        text_config = self.config.text_config
+        num_kv_heads = text_config.num_key_value_heads // self.world_size
+        head_dim = getattr(
+            text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
+        dtype_size = text_config.dtype.itemsize
 
-        Returns the layout so the caller can publish its sizes.
-        """
-        layout = self._plan_layout()
-        self.layout = layout
+        # attenton modules
+        attn_slots = self._collect_attention_slots()
+        linear_modules = self._collect_linear_layers()
+        
+        # calculate page bytes
+        max_state_bytes = max(
+            (self._linear_state_nbytes(m) for m in linear_modules), default=0)
+        attn_bytes_per_token = 2 * num_kv_heads * head_dim * dtype_size
+        block_size = self._choose_block_size(max_state_bytes, attn_bytes_per_token)
+        page_bytes = attn_bytes_per_token * block_size
+        assert max_state_bytes <= page_bytes, (
+            f"Linear state ({max_state_bytes} B) does not fit in one attention page ({page_bytes} B)")
+
+        # calculate num blocks
+        num_pools = len(attn_slots)
+        num_state_groups = ((len(linear_modules) + num_pools - 1) // num_pools
+                            if linear_modules else 0)
+        num_blocks = (self._probe_num_blocks(num_pools, page_bytes, reserve)
+                      if num_blocks is None
+                      else self._all_reduce_int(num_blocks, dist.ReduceOp.MIN))
+
+        self.layout = CacheLayout(
+            attn_slots=attn_slots,
+            linear_modules=linear_modules,
+            num_pools=num_pools,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            page_bytes=page_bytes,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=text_config.dtype,
+            dtype_size=dtype_size,
+            num_state_groups=num_state_groups,
+            max_state_bytes=max_state_bytes,
+        )
+        return self.layout
+
+    def allocate(self, reserve: int = 0, num_blocks: int | None = None) -> CacheLayout:
+        self.unbind()
+        layout = self.plan(reserve=reserve, num_blocks=num_blocks)
         self.pools = torch.empty(
             layout.num_pools, layout.num_blocks, layout.page_bytes, dtype=torch.uint8)
 
@@ -51,24 +92,46 @@ class CachePool:
         self._init_linear_state(layout)
         return layout
 
+    def unbind(self):
+        if self.pools is None:
+            return
+        for module in self.model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = [torch.empty(0, device="cuda") for _ in module.k_cache]
+                module.v_cache = [torch.empty(0, device="cuda") for _ in module.v_cache]
+            if hasattr(module, "conv_pool") and hasattr(module, "recurrent_pool"):
+                module.conv_pool = torch.empty(0, device="cuda")
+                module.recurrent_pool = torch.empty(0, device="cuda")
+        self.pools = None
+        self.layout = None
+        self.linear_state_len = []
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    def max_concurrent(self) -> int:
+        layout = self.layout
+        assert layout is not None, "page pool has not been planned yet"
+        usable = layout.num_blocks - (1 if layout.linear_modules else 0)   # 末块给 CUDA graph 占位
+        return max(1, usable // (1 + layout.num_state_groups))
+
     @property
     def block_size(self) -> int:
-        assert self.layout is not None, "page pool has not been allocated yet"
+        assert self.layout is not None, "page pool has not been planned yet"
         return self.layout.block_size
 
     @property
     def num_blocks(self) -> int:
-        assert self.layout is not None, "page pool has not been allocated yet"
+        assert self.layout is not None, "page pool has not been planned yet"
         return self.layout.num_blocks
 
     @property
     def num_state_groups(self) -> int:
-        assert self.layout is not None, "page pool has not been allocated yet"
+        assert self.layout is not None, "page pool has not been planned yet"
         return self.layout.num_state_groups
 
     @property
     def has_linear_attention(self) -> bool:
-        assert self.layout is not None, "page pool has not been allocated yet"
+        assert self.layout is not None, "page pool has not been planned yet"
         return bool(self.layout.linear_modules)
 
     @property
@@ -192,58 +255,22 @@ class CachePool:
         block_size = max(block_size, ((need + 255) // 256) * 256)
         return self._all_reduce_int(block_size, dist.ReduceOp.MAX)
 
-    def _probe_num_blocks(self, num_pools: int, page_bytes: int) -> int:
-        """Compute the number of page-pool rows from free GPU memory; each block owns one page per pool."""
+    def _probe_num_blocks(self, num_pools: int, page_bytes: int, reserve: int = 0) -> int:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()      # peak == current from here on
         free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        budget = int(total * self.config.gpu_memory_utilization - used - peak + current)
+        used = total - free                       # weights + CUDA context/NCCL, i.e. not page pool
+        budget = int(total * self.config.gpu_memory_utilization - used) - reserve
         num_blocks = self._all_reduce_int(
             budget // (num_pools * page_bytes), dist.ReduceOp.MIN)
         assert num_blocks >= 2, (
-            f"Page pool has only {num_blocks} blocks: at least 1 is needed for requests "
-            "and 1 for CUDA graph padding. Increase gpu_memory_utilization or reduce max_model_len")
+            f"页池只能放下 {num_blocks} 块,低于下限 2(1 块给请求、1 块给 CUDA graph 占位)。"
+            f"前向激活预留了 {reserve / 2**20:.0f} MB,"
+            f"显存预算 total*gpu_memory_utilization-used = "
+            f"{(total * self.config.gpu_memory_utilization - used) / 2**30:.2f} GiB。"
+            "请调小 --max-num-seqs / --max-model-len / --gpu-memory-utilization")
         return num_blocks
-
-    def _plan_layout(self) -> CacheLayout:
-        text_config = self.config.text_config
-        num_kv_heads = text_config.num_key_value_heads // self.world_size
-        head_dim = getattr(
-            text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
-        dtype_size = text_config.dtype.itemsize
-
-        attn_slots = self._collect_attention_slots()
-        linear_modules = self._collect_linear_layers()
-        max_state_bytes = max(
-            (self._linear_state_nbytes(m) for m in linear_modules), default=0)
-
-        attn_bytes_per_token = 2 * num_kv_heads * head_dim * dtype_size
-        block_size = self._choose_block_size(max_state_bytes, attn_bytes_per_token)
-
-        page_bytes = attn_bytes_per_token * block_size
-        assert max_state_bytes <= page_bytes, (
-            f"Linear state ({max_state_bytes} B) does not fit in one attention page ({page_bytes} B)")
-
-        num_pools = len(attn_slots)
-        num_state_groups = ((len(linear_modules) + num_pools - 1) // num_pools
-                            if linear_modules else 0)
-        num_blocks = self._probe_num_blocks(num_pools, page_bytes)
-
-        return CacheLayout(
-            attn_slots=attn_slots,
-            linear_modules=linear_modules,
-            num_pools=num_pools,
-            num_blocks=num_blocks,
-            block_size=block_size,
-            page_bytes=page_bytes,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            dtype=text_config.dtype,
-            dtype_size=dtype_size,
-            num_state_groups=num_state_groups,
-            max_state_bytes=max_state_bytes,
-        )
 
     # memory binding
 

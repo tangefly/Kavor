@@ -7,7 +7,6 @@ from multiprocessing.shared_memory import SharedMemory
 
 from kavor.config import Config
 from kavor.engine.cache_pool import CachePool
-from kavor.engine.multimodal import ModalInputs
 from kavor.engine.sequence import Sequence
 from kavor.layers.sampler import Sampler
 from kavor.utils.context import set_context, get_context, reset_context
@@ -38,7 +37,6 @@ class ModelRunner:
         Sequence.block_size = config.kvcache_block_size
         self.model = AutoModelForCausalLM.from_pretrained(hf_config, use_tqdm=self.enable_log)
         self.sampler = Sampler()
-        # self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -108,17 +106,94 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def profile_prefill_shape(self) -> tuple[int, int]:
+        """Worst-case prefill shape: (longest single sequence, number of sequences)."""
+        seq_len = min(self.config.max_num_batched_tokens, self.config.max_model_len)
+        num_seqs = max(1, min(self.config.max_num_batched_tokens // seq_len,
+                              self.config.max_num_seqs))
+        return seq_len, num_seqs
+
+    def _padding_slot_ids(self, bs: int) -> torch.Tensor | None:
+        slot = self.cache.linear_padding_slot
+        if slot is None:
+            return None
+        return torch.full((bs, self.cache.num_state_groups), slot,
+                          dtype=torch.int64, device="cuda")
+
+    @torch.inference_mode()
     def warmup_model(self):
+        """Run the worst-case prefill once: profiling plus the one-off kernel/compile cost.
+
+        The real ``run()`` path cannot be used here: fake sequences have no block table,
+        which would leave ``slot_mapping`` empty and trip the store-kvcache assertion.
+        """
+        seq_len, num_seqs = self.profile_prefill_shape()
+        total = seq_len * num_seqs
+        input_ids = torch.zeros(total, dtype=torch.int64, device="cuda")
+        positions = torch.arange(seq_len, device="cuda").repeat(num_seqs)
+        cu_seqlens = torch.arange(0, total + 1, seq_len, dtype=torch.int32, device="cuda")
+        # the temporary profiling pool is sized for ``total`` tokens, so these slots are valid
+        slot_mapping = torch.arange(total, dtype=torch.int32, device="cuda")
+        set_context(True, cu_seqlens, cu_seqlens, seq_len, seq_len,
+                    slot_mapping, None, None, self._padding_slot_ids(num_seqs))
+        try:
+            logits = self.model.compute_logits(self.model(input_ids, positions))
+            self.sampler(logits, torch.ones(num_seqs, dtype=torch.float32, device="cuda"))
+        finally:
+            reset_context()
+
+    @torch.inference_mode()
+    def _profile_decode(self, bs: int):
+        """Run one decode step at ``bs`` (the largest captured graph) to measure its peak."""
+        slot_mapping = torch.zeros(bs, dtype=torch.int32, device="cuda")
+        context_lens = torch.ones(bs, dtype=torch.int32, device="cuda")
+        block_tables = torch.zeros(bs, 1, dtype=torch.int32, device="cuda")
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens,
+                    block_tables=block_tables, linear_slot_ids=self._padding_slot_ids(bs))
+        try:
+            input_ids = torch.zeros(bs, dtype=torch.int64, device="cuda")
+            positions = torch.zeros(bs, dtype=torch.int64, device="cuda")
+            logits = self.model.compute_logits(self.model(input_ids, positions))
+            self.sampler(logits, torch.ones(bs, dtype=torch.float32, device="cuda"))
+        finally:
+            reset_context()
+
+    @torch.inference_mode()
+    def profile_activation_peak(self, max_bs: int) -> int:
+        """Measure prefill/decode activation peaks and return the bytes to keep free.
+
+        With CUDA graphs we must keep a second decode peak: capture warms up eagerly and
+        ``torch.cuda.graph`` allocates its own private pool, so the eager warmup's cached
+        blocks cannot be reused by the graph pool.
+
+        No extra margin is added on purpose: the pool is sized from
+        ``gpu_memory_utilization``, so whatever is left between that and the total stays
+        unused and is the actual safety net. Keep the utilization at or below ~0.95 if you
+        want that net to stay larger than allocator/graph-exec noise.
+        """
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        seq_len = min(max_num_batched_tokens, max_model_len)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence(ModalInputs([0] * seq_len, "")) for _ in range(num_seqs)]
-        for seq in seqs:
-            seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
-        torch.cuda.empty_cache()
+
+        def measure(fn) -> int:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            base = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+            fn()
+            torch.cuda.synchronize()
+            return torch.cuda.memory_stats()["allocated_bytes.all.peak"] - base
+
+        prefill_peak = measure(self.warmup_model)
+        decode_peak = measure(lambda: self._profile_decode(max_bs))
+        graph_pool = 0 if self.enforce_eager else decode_peak
+        reserve = graph_pool + max(prefill_peak, decode_peak)
+        if self.enable_log:
+            logger.info(
+                "激活 profiling: prefill %.2f GiB, decode(bs=%d) %.2f GiB,"
+                " CUDA graph 池 %.2f GiB -> 预留 %.2f GiB",
+                prefill_peak / 2**30, max_bs, decode_peak / 2**30,
+                graph_pool / 2**30, reserve / 2**30)
+        return reserve
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
@@ -127,7 +202,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, mm_kwargs: dict | None = None):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs[-1]:
             logits = self.model(input_ids, positions, **(mm_kwargs or {}))
             return self.model.compute_logits(logits)
         else:
@@ -162,7 +237,7 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         text_config = config.text_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(self.config.max_num_seqs, 512, self.cache.max_concurrent())
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
@@ -173,7 +248,10 @@ class ModelRunner:
         linear_slot_ids = (None if self.cache.linear_padding_slot is None else
                            torch.full((max_bs, self.cache.num_state_groups),
                                       self.cache.linear_padding_slot, dtype=torch.int64))
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [bs for bs in (1, 2, 4, 8) if bs <= max_bs]
+        self.graph_bs += list(range(16, max_bs + 1, 16))
+        if self.graph_bs[-1] != max_bs:
+            self.graph_bs.append(max_bs)
         self.graphs = {}
         self.graph_pool = None
 
@@ -202,15 +280,43 @@ class ModelRunner:
         )
 
     def allocate_kv_cache(self):
-        """建页池,并把布局参数发布给调度器(rank 0 的 Scheduler 依赖这些值)。"""
+        """两段式建页池:先绑临时小池实测前向峰值,再按预留量规划正式池。
+
+        ``gpu_memory_utilization`` 约束的是「权重 + 页池 + 前向峰值」,而页池大小又反过来
+        决定前向峰值(峰值里最大的一项是 batch 维度的线性注意力状态),所以先做一次乐观
+        估计拿到 profiling 用的 batch,再实测、再正式规划。
+        """
         self.cache = CachePool(self.model, self.config, self.world_size)
-        layout = self.cache.allocate()
+
+        # 1) 乐观规划(不留激活余量):真实容量不会超过它,用它决定 profiling 的 batch 上界
+        self.cache.plan()
+        probe_bs = min(self.config.max_num_seqs, 512, self.cache.max_concurrent())
+
+        # 2) 绑一个刚好能跑完 prefill profiling 的临时池(prefill 的 slot_mapping 必须落在池内)
+        seq_len, num_seqs = self.profile_prefill_shape()
+        profile_blocks = (seq_len * num_seqs + self.cache.block_size - 1) // self.cache.block_size + 2
+        self.cache.allocate(num_blocks=profile_blocks)
+
+        # 3) 实测峰值,再建正式池(allocate 会先释放临时池)
+        reserve = self.profile_activation_peak(probe_bs)
+        layout = self.cache.allocate(reserve=reserve)
+
         self.block_size = layout.block_size
         Sequence.block_size = self.block_size
         self.config.kvcache_block_size = self.block_size
         self.config.num_kvcache_blocks = layout.num_blocks
         self.config.has_linear_attention = self.cache.has_linear_attention
         self.config.num_linear_state_groups = self.cache.num_state_groups
+
+        # 4) 把 max_num_seqs 收敛到页池真正能容纳的并发:Scheduler 和 CUDA graph 都用这个值
+        capacity = self.cache.max_concurrent()
+        if capacity < self.config.max_num_seqs:
+            if self.enable_log:
+                logger.warning(
+                    "max_num_seqs %d -> %d:页池只有 %d 块,每条序列至少要 1 个 KV 块 + %d 个状态块",
+                    self.config.max_num_seqs, capacity, self.cache.num_blocks,
+                    self.cache.num_state_groups)
+            self.config.max_num_seqs = capacity
         if self.enable_log:
             self.cache.log_summary()
 

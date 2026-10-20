@@ -5,7 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import time
 
@@ -23,6 +23,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="api_server")
     add_server_args(parser)  # 参数定义统一放在 cli.py,kavor serve 子命令复用
     return parser.parse_args(argv)
+
+
+class APIError(Exception):
+    """OpenAI 风格的错误信封:{"error": {"message", "type", "param", "code"}}"""
+
+    def __init__(self, message: str, status_code: int = 400,
+                 type: str = "invalid_request_error",
+                 param: str | None = None, code: str | None = None):
+        self.message = message
+        self.status_code = status_code
+        self.type = type
+        self.param = param
+        self.code = code
+
+
+def model_not_found(requested: str, served: str) -> APIError:
+    return APIError(
+        f"The model `{requested}` does not exist. This server serves `{served}`.",
+        status_code=404, param="model", code="model_not_found")
+
 
 def to_sampling_params(req: ChatCompletionRequest | GenerateRequest, args: argparse.Namespace) -> SamplingParams:
     max_tokens = req.max_tokens or getattr(req, "max_completion_tokens", None) or args.max_model_len
@@ -80,6 +100,20 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
 
     app = FastAPI(lifespan=lifespan)
 
+    @app.exception_handler(APIError)
+    async def api_error_handler(request: Request, exc: APIError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"message": exc.message, "type": exc.type,
+                               "param": exc.param, "code": exc.code}},
+        )
+
+    def check_model(requested: str) -> None:
+        """请求里的 model 必须和本服务实际提供的名字一致(/v1/models 里的 id)。"""
+        served = app.state.engine.model_name
+        if requested != served:
+            raise model_not_found(requested, served)
+
     @app.get("/health")
     async def health():
         if app.state.engine.is_alive():
@@ -91,7 +125,7 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
         return {
             "object": "list",
             "data": [{
-                "id": args.model,
+                "id": app.state.engine.model_name,
                 "object": "model",
                 "owned_by": "kavor",
             }],
@@ -99,6 +133,8 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
 
     @app.post("/generate")
     async def generate(req: GenerateRequest):
+        if req.model is not None:
+            check_model(req.model)
         if not req.prompt:
             raise HTTPException(status_code=400, detail="prompt 不能为空")
         request_id = req.request_id or uuid.uuid4().hex
@@ -122,9 +158,8 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
         
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
-        if req.model is not app.state.engine.model_name:
-            pass
-        
+        check_model(req.model)
+
         request_id = uuid.uuid4().hex
         
         messages = []
