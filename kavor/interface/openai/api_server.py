@@ -220,7 +220,7 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
 def run(args: argparse.Namespace):
     engine = AsyncEngine(
         args.model,
-        model_name=args.model_name,
+        model_name=args.served_model_name,
         tensor_parallel_size=args.tensor_parallel_size,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,

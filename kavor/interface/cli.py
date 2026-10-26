@@ -6,7 +6,7 @@ import traceback
 def add_server_args(parser: argparse.ArgumentParser):
     """serve 子命令的参数定义(vLLM 风格:模型路径为位置参数)。"""
     parser.add_argument("model", type=str, help="本地模型目录(只接受本地路径)")
-    parser.add_argument("--model_name", type=str, default=None)
+    parser.add_argument("--served-model-name", type=str, default=None)
     parser.add_argument("--tensor-parallel-size", "--tp", type=int, default=1)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)

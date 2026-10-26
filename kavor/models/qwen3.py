@@ -4,7 +4,7 @@ import torch.distributed as dist
 from transformers import Qwen3Config
 
 from kavor.layers.activation import SiluAndMul
-from kavor.layers.attention import Attention
+from kavor.layers.attention.flash_attention_kvcache import Attention
 from kavor.layers.layernorm import RMSNorm
 from kavor.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from kavor.layers.rotary_embedding import get_rope

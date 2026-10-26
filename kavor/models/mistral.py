@@ -4,7 +4,7 @@ import torch.distributed as dist
 from transformers import MistralConfig
 
 from kavor.layers.activation import SiluAndMul
-from kavor.layers.attention import Attention
+from kavor.layers.attention.flash_attention_kvcache import Attention
 from kavor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from kavor.layers.layernorm import RMSNorm
 from kavor.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
