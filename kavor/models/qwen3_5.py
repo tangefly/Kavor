@@ -8,10 +8,20 @@ import torch.distributed as dist
 
 from kavor.layers.activation import SiluAndMul
 from kavor.layers.attention.flash_attention_kvcache import Attention
-from kavor.layers.attention.gated_delta_rule import (
-    torch_recurrent_gated_delta_rule,
-    torch_chunk_gated_delta_rule
-)
+
+try:
+    from fla.ops.gated_delta_rule import (
+        fused_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
+        chunk_gated_delta_rule,
+    )
+    print("Import gated_delta_rule from fla")
+except ImportError:
+    from kavor.layers.attention.gated_delta_rule import (
+        torch_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
+        torch_chunk_gated_delta_rule as chunk_gated_delta_rule
+    )
+    print("Import gated_delta_rule from torch")
+
 from kavor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from kavor.layers.layernorm import RMSNorm
 from kavor.layers.linear import (
@@ -332,7 +342,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             z = self.in_proj_z(x).reshape(1, seq_len, -1, self.head_v_dim)
             beta, g = self._beta_g(x, seq_len)
 
-            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 query,
                 key_states,
                 value,
@@ -365,7 +375,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = self.in_proj_z(hidden_states).reshape(-1, 1, self.num_v_heads, self.head_v_dim)
         beta, g = self._beta_g(hidden_states, 1)
 
-        core_attn_out, last_recurrent_states = torch_recurrent_gated_delta_rule(
+        core_attn_out, last_recurrent_states = recurrent_gated_delta_rule(
             query,
             key_states,
             value,

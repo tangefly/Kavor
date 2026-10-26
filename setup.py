@@ -42,7 +42,8 @@ BASE_REQUIREMENTS = [
     "transformers>=4.51.0",
     "xxhash",
     "fastapi",
-    "uvicorn"
+    "uvicorn",
+    "flash-linear-attention[cuda]"
 ]
 _PROBE = (
     "import json, torch; print(json.dumps({"
