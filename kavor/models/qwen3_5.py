@@ -14,13 +14,11 @@ try:
         fused_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
         chunk_gated_delta_rule,
     )
-    print("Import gated_delta_rule from fla")
 except ImportError:
     from kavor.layers.attention.gated_delta_rule import (
         torch_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
         torch_chunk_gated_delta_rule as chunk_gated_delta_rule
     )
-    print("Import gated_delta_rule from torch")
 
 from kavor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from kavor.layers.layernorm import RMSNorm
@@ -32,7 +30,7 @@ from kavor.layers.linear import (
 )
 from kavor.layers.rotary_embedding import apply_rotary_emb
 from kavor.utils.context import get_context
-from kavor.utils.mm_plan import plan_shards
+from kavor.utils.mm_plan import plan_shards, visible_row_index
 
 from transformers.activations import ACT2FN
 from transformers.utils import torch_compilable_check
@@ -1086,6 +1084,19 @@ class Qwen3_5Model(nn.Module):
                     dist.broadcast(full[start:end], src=src)
         return full
 
+    def _select_visible_rows(
+        self,
+        embeds: torch.Tensor,
+        grid_thw: torch.Tensor,
+        visible_ranges: list[tuple[int, int]] | None,
+    ) -> torch.Tensor:
+        rows = (grid_thw.prod(-1) // (self.visual.spatial_merge_size ** 2)).tolist()
+        keep = visible_row_index(rows, visible_ranges)
+        if keep is None:
+            return embeds
+        return embeds.index_select(
+            0, torch.tensor(keep, dtype=torch.long, device=embeds.device))
+
     def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
@@ -1178,6 +1189,7 @@ class Qwen3_5Model(nn.Module):
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
+        image_visible_ranges: list[tuple[int, int]] | None = None,
         **kwargs,
     ):
         inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -1186,6 +1198,8 @@ class Qwen3_5Model(nn.Module):
             image_embeds = self._vision_features_parallel(
                 self.get_image_features, pixel_values, image_grid_thw, **kwargs)
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            image_embeds = self._select_visible_rows(
+                image_embeds, image_grid_thw, image_visible_ranges)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )

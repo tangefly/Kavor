@@ -32,3 +32,23 @@ def plan_shards(row_counts: Sequence[int], world_size: int) -> list[Shard]:
         Shard(cuts[r], cuts[r + 1], cum_rows[cuts[r]], cum_rows[cuts[r + 1]])
         for r in range(world_size)
     ]
+
+
+def visible_row_index(
+    row_counts: Sequence[int],
+    visible_ranges: Sequence[Sequence[int]] | None,
+) -> list[int] | None:
+    
+    if visible_ranges is None:
+        return None
+    if len(visible_ranges) != len(row_counts):
+        raise ValueError(
+            f"visible_ranges 有 {len(visible_ranges)} 张图,grid 有 {len(row_counts)} 张")
+    keep = []
+    base = 0
+    for row, (offset, count) in zip(row_counts, visible_ranges):
+        if not (0 <= offset <= row and 0 <= count <= row - offset):
+            raise ValueError(f"非法偏移 (offset={offset}, count={count}),这张图只有 {row} 行")
+        keep.extend(range(base + offset, base + offset + count))
+        base += row
+    return None if len(keep) == base else keep

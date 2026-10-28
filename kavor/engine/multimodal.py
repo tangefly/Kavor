@@ -22,6 +22,7 @@ class ModalInputs:
     pixel_values_videos: torch.Tensor | None = None
     video_grid_thw: torch.Tensor | None = None
     image_hash_id: bytes | int = -1
+    image_pad_ranges: list[tuple[int, int]] | None = None   # prompt 里每张图的 (起点, 占位符个数)
     rope_delta: int = 0                             # prefill 时由模型回填,解码步的位置要加它
     
     def for_workers(self, prefill: bool) -> "ModalInputs":
@@ -32,6 +33,7 @@ class ModalInputs:
                 mm_token_type_ids=self.mm_token_type_ids,
                 image_grid_thw=self.image_grid_thw,
                 video_grid_thw=self.video_grid_thw,
+                image_pad_ranges=self.image_pad_ranges,     # TP worker 也要算分块偏移
                 rope_delta=self.rope_delta,
             )
         return ModalInputs(token_ids=[], prompt="", rope_delta=self.rope_delta)
@@ -68,7 +70,9 @@ class ModalInputs:
                 image_grid_thw=inputs.get("image_grid_thw"),
                 pixel_values_videos=inputs.get("pixel_values_videos"),
                 video_grid_thw=inputs.get("video_grid_thw"),
-                image_hash_id=cls.hash_images(inputs.get("pixel_values"), inputs.get("image_grid_thw"))
+                image_hash_id=cls.hash_images(inputs.get("pixel_values"), inputs.get("image_grid_thw")),
+                image_pad_ranges=find_image_pad_ranges(
+                    inputs["input_ids"][0], processor.image_token_id)
             )
         else:
             prompt = tokenizer.apply_chat_template(
@@ -91,7 +95,24 @@ class ModalInputs:
             digest.update(repr(tuple(tensor.shape)).encode())
             digest.update(tensor.reshape(-1).view(torch.uint8).numpy())
         return digest.digest()
+    
+def find_image_pad_ranges(token_ids, image_pad_token_id):
+    tokens = torch.as_tensor(token_ids)
+    mask = tokens == image_pad_token_id
 
+    start_mask = mask.clone()
+    start_mask[1:] &= ~mask[:-1]
+
+    end_mask = mask.clone()
+    end_mask[:-1] &= ~mask[1:]
+
+    starts = torch.where(start_mask)[0].tolist()
+    ends = torch.where(end_mask)[0].tolist()
+
+    lengths = [end - start + 1 for start, end in zip(starts, ends)]
+
+    ranges = list(zip(starts, lengths))
+    return ranges
 
 def _content_of(message):
     """消息可能是 dict(库内调用),也可能是 pydantic 模型(API 层),两种都要能取到 content。"""

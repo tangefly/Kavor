@@ -22,7 +22,7 @@ from kavor.layers.linear import (
     RowParallelLinear,
 )
 from kavor.layers.rotary_embedding import apply_rotary_emb
-from kavor.utils.mm_plan import plan_shards
+from kavor.utils.mm_plan import plan_shards, visible_row_index
 
 
 class Qwen3VLVisionMLP(nn.Module):
@@ -579,8 +579,6 @@ class Qwen3VLModel(nn.Module):
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    # -- 视觉特征 ---------------------------------------------------------
-
     def get_image_features(
         self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor
     ) -> list[torch.Tensor]:
@@ -640,6 +638,21 @@ class Qwen3VLModel(nn.Module):
 
         return merged_full, deepstack_full
 
+    def _select_visible_rows(
+        self,
+        embeds: torch.Tensor,
+        deepstack_embeds: list[torch.Tensor],
+        grid_thw: torch.Tensor,
+        visible_ranges: list[tuple[int, int]] | None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        rows = (grid_thw.prod(-1) // (self.spatial_merge_size ** 2)).tolist()
+        keep = visible_row_index(rows, visible_ranges)
+        if keep is None:
+            return embeds, deepstack_embeds
+        index = torch.tensor(keep, dtype=torch.long, device=embeds.device)
+        # deepstack 的行序和 merger 输出一致,必须一起切
+        return embeds.index_select(0, index), [e.index_select(0, index) for e in deepstack_embeds]
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -649,6 +662,7 @@ class Qwen3VLModel(nn.Module):
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
+        image_visible_ranges: list[tuple[int, int]] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -673,13 +687,17 @@ class Qwen3VLModel(nn.Module):
         if pixel_values is not None:
             if image_grid_thw is None:
                 raise ValueError("传了 pixel_values 就要同时传 image_grid_thw")
-            image_embeds, deepstack_image_embeds = self._vision_features_parallel(
-                pixel_values, image_grid_thw)
-            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, deepstack_image_embeds = self._place_vision_tokens(
-                input_ids, inputs_embeds, image_embeds, deepstack_image_embeds, "image")
-            if image_mask is not None:
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            # 本步一个图片占位符都没有(整张图都在 prefix cache 里):视觉塔不用跑
+            if (input_ids == self.config.image_token_id).any():
+                image_embeds, deepstack_image_embeds = self._vision_features_parallel(
+                    pixel_values, image_grid_thw)
+                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                image_embeds, deepstack_image_embeds = self._select_visible_rows(
+                    image_embeds, deepstack_image_embeds, image_grid_thw, image_visible_ranges)
+                image_mask, deepstack_image_embeds = self._place_vision_tokens(
+                    input_ids, inputs_embeds, image_embeds, deepstack_image_embeds, "image")
+                if image_mask is not None:
+                    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
             if video_grid_thw is None:
@@ -730,12 +748,6 @@ class Qwen3VLModel(nn.Module):
         deepstack_embeds: list[torch.Tensor],
         name: str,
     ) -> tuple[torch.Tensor | None, list[torch.Tensor] | None]:
-        """找出本步 token 里该填视觉特征的位置,并校验数量。
-
-        正常 prefill 时占位符数量和特征数相等;如果整段图/视频都被 prefix cache 命中,
-        本步只剩文本 token,这里返回 None,让调用方跳过填充(deepstack 同理)。
-        只有部分占位符落在本步(跨块边界)时才报错 —— 这种切法目前不支持。
-        """
         token_id = self.config.image_token_id if name == "image" else self.config.video_token_id
         mask = input_ids == token_id
         n_tokens = int(mask.sum())
@@ -745,7 +757,7 @@ class Qwen3VLModel(nn.Module):
             raise ValueError(
                 f"{name} 特征和占位符对不上: 本步有 {n_tokens} 个占位符,"
                 f"但特征有 {vision_embeds.numel() // inputs_embeds.shape[-1]} 个 token。"
-                "如果不是 prefix cache 把一段视觉 token 切在了两步里,检查 processor 的输入")
+                "检查 processor 的输入;图片还可能是 image_visible_ranges 算错了")
         return mask.unsqueeze(-1).to(inputs_embeds.device), deepstack_embeds
 
 

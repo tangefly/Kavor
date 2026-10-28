@@ -423,7 +423,42 @@ class ModelRunner:
                       if getattr(seq.inputs, pixel_key) is not None]
             kwargs[grid_key] = torch.cat(grids, dim=0).cuda(non_blocking=True)
             kwargs[pixel_key] = self._scatter_mm(pixels, kwargs[grid_key])
+        if "image_grid_thw" in kwargs:
+            kwargs["image_visible_ranges"] = self._image_visible_ranges(
+                mm_seqs, kwargs["image_grid_thw"])
         return kwargs
+
+    def _image_visible_ranges(self, seqs: list[Sequence],
+                              grid: torch.Tensor) -> list[tuple[int, int]] | None:
+        """每张图在本步窗口里可见的特征行 (offset, count);全图都可见时返回 None。"""
+        merge_unit = self.config.vision_config.spatial_merge_size ** 2
+        ranges, lengths = [], []
+        for seq in seqs:
+            inputs = seq.inputs
+            if inputs.image_grid_thw is None:
+                continue
+            rows = (inputs.image_grid_thw.prod(-1) // merge_unit).tolist()
+            pads = inputs.image_pad_ranges
+            assert pads is not None, (
+                "多模态输入缺少 image_pad_ranges:只有 ModalInputs.build_inputs 会填它,"
+                "手工构造 ModalInputs 时不能直接带 pixel_values")
+            assert len(pads) == len(rows), (
+                f"image_pad_ranges({pads}) 和 image_grid_thw 的 {len(rows)} 张图对不上")
+            start = seq.num_cached_tokens
+            end = start + seq.num_scheduled_tokens
+            for (pad_start, pad_len), row in zip(pads, rows):
+                assert pad_len == row, (
+                    f"占位符个数 {pad_len} 和 grid 推出的特征行数 {row} 对不上:"
+                    "processor 出的 input_ids 和 grid 不是同一张图")
+                begin = min(max(start - pad_start, 0), pad_len)
+                finish = min(max(end - pad_start, 0), pad_len)
+                ranges.append((begin, max(finish - begin, 0)))
+                lengths.append(pad_len)
+        assert len(ranges) == grid.shape[0], (
+            f"算出 {len(ranges)} 张图,和 image_grid_thw 的 {grid.shape[0]} 行对不上")
+        if all(count == length for (_, count), length in zip(ranges, lengths)):
+            return None
+        return ranges
 
     def _scatter_mm(self, pixels: list[torch.Tensor], grid: torch.Tensor) -> torch.Tensor:
         world = self.world_size
