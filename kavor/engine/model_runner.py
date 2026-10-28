@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from tqdm.auto import tqdm
 
 from kavor.config import Config
 from kavor.engine.cache_pool import CachePool
@@ -255,7 +256,11 @@ class ModelRunner:
         self.graphs = {}
         self.graph_pool = None
 
-        for bs in reversed(self.graph_bs):
+        pbar = tqdm(reversed(self.graph_bs), total=len(self.graph_bs),
+                    desc="Capturing CUDA graphs", dynamic_ncols=True,
+                    disable=not self.enable_log)
+        for bs in pbar:
+            pbar.set_postfix(batch_size=bs)
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
                         block_tables=block_tables[:bs],

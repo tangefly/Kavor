@@ -1,9 +1,10 @@
 from collections import deque
-import xxhash
-import numpy as np
+import pickle, hashlib
 
 from kavor.engine.sequence import Sequence
+from kavor.utils.logger import logger
 
+NONE_HASH = -1
 
 class Block:
 
@@ -45,14 +46,17 @@ class BlockManager:
             "调大 gpu_memory_utilization 或减小 max_model_len")
         self.free_block_ids: deque[int] = deque(range(free_end))
         self.used_block_ids: set[int] = set()
+        # prefix cache 命中统计:每个请求开始 prefill 时累计一次
+        self.prefix_cache_hit_tokens = 0
+        self.prefix_cache_prompt_tokens = 0
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
-        h = xxhash.xxh64()
-        if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
-        return h.intdigest()
+    def hash_block_tokens(cls, parent_block_hash: int, curr_block_token_ids: list[int], extra_keys=None):
+        if not parent_block_hash:
+            parent_block_hash = NONE_HASH
+        curr_block_token_ids_tuple = tuple(curr_block_token_ids)
+        hush_group = (parent_block_hash, curr_block_token_ids_tuple, extra_keys)
+        return hashlib.sha256(pickle.dumps(hush_group, protocol=5)).digest()
 
     def allocate_block(self) -> int:
         block_id = self.free_block_ids.popleft()
@@ -69,34 +73,33 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate_prefill(self, seq: Sequence) -> int:        
-        hash_id = -1
+    def can_allocate_prefill(self, seq: Sequence) -> int:
+        prefix_hash_id = -1
         num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
-        # prefix caching
-        if self.enable_prefix_cache and not seq.is_multimodal:
+        num_needed_blocks = seq.num_blocks
+        if self.enable_prefix_cache:
             for i in range(seq.num_blocks - 1):
                 token_ids = seq.block(i)
-                hash_id = self.compute_hash(token_ids, hash_id)
-                block_id = self.hash_to_block_id.get(hash_id, -1)
+                prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.inputs.image_hash_id)
+                block_id = self.hash_to_block_id.get(prefix_hash_id, -1)
                 if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                     break
                 num_cached_blocks += 1
                 if block_id in self.used_block_ids:
-                    num_new_blocks -= 1
-        num_new_blocks += self.num_state_groups
+                    num_needed_blocks -= 1
+        num_needed_blocks += self.num_state_groups
         # lack of enough blocks for prefill
-        if len(self.free_block_ids) < num_new_blocks:
+        if len(self.free_block_ids) < num_needed_blocks:
             return -1
         return num_cached_blocks
 
     def allocate_prefill(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
-        h = -1
+        prefix_hash_id = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
+            prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.inputs.image_hash_id)
+            block_id = self.hash_to_block_id[prefix_hash_id]
             block = self.blocks[block_id]
             if block_id in self.used_block_ids:
                 block.ref_count += 1
@@ -110,7 +113,19 @@ class BlockManager:
         if self.has_linear_attention:
             assert seq.state_block_ids is None
             seq.state_block_ids = [self.allocate_block() for _ in range(self.num_state_groups)]
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        cached_tokens = num_cached_blocks * self.block_size
+        seq.num_cached_tokens = cached_tokens
+        if self.enable_prefix_cache:
+            self.prefix_cache_hit_tokens += cached_tokens
+            self.prefix_cache_prompt_tokens += seq.num_tokens
+            logger.info(
+                "prefix cache: seq %d 命中 %d/%d tokens (%.1f%%),"
+                " 累计 %d/%d tokens (%.1f%%)",
+                seq.seq_id, cached_tokens, seq.num_tokens,
+                100.0 * cached_tokens / seq.num_tokens,
+                self.prefix_cache_hit_tokens, self.prefix_cache_prompt_tokens,
+                100.0 * self.prefix_cache_hit_tokens / self.prefix_cache_prompt_tokens,
+            )
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -139,10 +154,10 @@ class BlockManager:
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
         if start == end: return
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        prefix_hash_id = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block.update(h, token_ids)
-            self.hash_to_block_id[h] = block.block_id
+            prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.inputs.image_hash_id)
+            block.update(prefix_hash_id, token_ids)
+            self.hash_to_block_id[prefix_hash_id] = block.block_id

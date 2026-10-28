@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import base64
 import io
 import urllib.request
+import hashlib
 
 import numpy as np
 import torch
@@ -20,7 +21,9 @@ class ModalInputs:
     image_grid_thw: torch.Tensor | None = None
     pixel_values_videos: torch.Tensor | None = None
     video_grid_thw: torch.Tensor | None = None
+    image_hash_id: bytes | int = -1
     rope_delta: int = 0                             # prefill 时由模型回填,解码步的位置要加它
+    
     def for_workers(self, prefill: bool) -> "ModalInputs":
         if prefill:
             return ModalInputs(
@@ -65,6 +68,7 @@ class ModalInputs:
                 image_grid_thw=inputs.get("image_grid_thw"),
                 pixel_values_videos=inputs.get("pixel_values_videos"),
                 video_grid_thw=inputs.get("video_grid_thw"),
+                image_hash_id=cls.hash_images(inputs.get("pixel_values"), inputs.get("image_grid_thw"))
             )
         else:
             prompt = tokenizer.apply_chat_template(
@@ -74,6 +78,19 @@ class ModalInputs:
                 token_ids=inputs["input_ids"][0].tolist(),
                 prompt=prompt,
             )
+    
+    @classmethod
+    def hash_images(cls, pixel_values, image_grid_thw):
+        digest = hashlib.sha256()
+        for tensor in (pixel_values, image_grid_thw):
+            if tensor is None:
+                digest.update(b"none")
+                continue
+            tensor = tensor.detach().to("cpu").contiguous()
+            digest.update(str(tensor.dtype).encode())
+            digest.update(repr(tuple(tensor.shape)).encode())
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy())
+        return digest.digest()
 
 
 def _content_of(message):

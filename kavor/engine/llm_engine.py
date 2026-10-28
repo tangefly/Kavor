@@ -134,7 +134,7 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
     
-    def normalize_input(
+    def normalize_inputs(
         self, 
         inputs: list[str] | list[list[int]] | list[ModalInputs]
     ) -> list[ModalInputs]:
@@ -158,7 +158,7 @@ class LLMEngine:
         use_tqdm: bool = True,
     ) -> list[str]:
         
-        inputs = self.normalize_input(inputs)
+        inputs = self.normalize_inputs(inputs)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(inputs)
         for item, sp in zip(inputs, sampling_params):

@@ -12,23 +12,23 @@ def encode_image(image_path):
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-image_base64 = encode_image("test.png")
+image_base64 = encode_image("image.png")
 
 response = client.chat.completions.create(
-    model="Qwen3.5-4B",
+    model="Qwen3-VL-4B-Instruct",
     messages=[
         {
             "role": "user",
             "content": [
                 {
-                    "type": "text",
-                    "text": "提取图片文字",
-                },
-                {
                     "type": "image_url",
                     "image_url": {
                         "url": f"data:image/jpeg;base64,{image_base64}"
                     },
+                },
+                {
+                    "type": "text",
+                    "text": "提取图片文字",
                 },
             ],
         }
