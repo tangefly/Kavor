@@ -143,10 +143,6 @@ def apply_rotary_pos_emb_vision(
 
 
 class Qwen3VLVisionAttention(nn.Module):
-    """视觉塔的 packed 变长 attention:一张图(或一帧)一段,段内可见,段间不互相可见。
-
-    这里不走页式 KV cache —— 视觉塔每次 prefill 只跑一次,没有增量解码。
-    """
 
     def __init__(self, config: Qwen3VLVisionConfig) -> None:
         super().__init__()
@@ -243,7 +239,7 @@ class Qwen3VLVisionModel(nn.Module):
 
     @staticmethod
     def attention_seqlens(grid_thw: torch.Tensor) -> tuple[torch.Tensor, int]:
-        """packed attention 的段边界:每个 t 帧单独一段,长度 h*w。"""
+        """packed attention 的段边界:每个时域 patch 单独一段,长度 h*w。"""
         seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
         cu_seqlens = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0), value=0)
         return cu_seqlens, int(seqlens.max())
@@ -520,8 +516,7 @@ class Qwen3VLModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """按“文本连续段 / 每张图 / 每帧视频”切分序列,生成 3D M-RoPE 位置和 rope_delta。"""
-        # 视频用时间戳分隔,每个 <vision_start> <frame> <vision_end> 是一段,所以按 T 展开
+
         if video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
             video_grid_thw[:, 0] = 1
@@ -650,7 +645,6 @@ class Qwen3VLModel(nn.Module):
         if keep is None:
             return embeds, deepstack_embeds
         index = torch.tensor(keep, dtype=torch.long, device=embeds.device)
-        # deepstack 的行序和 merger 输出一致,必须一起切
         return embeds.index_select(0, index), [e.index_select(0, index) for e in deepstack_embeds]
 
     def forward(
@@ -663,6 +657,7 @@ class Qwen3VLModel(nn.Module):
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         image_visible_ranges: list[tuple[int, int]] | None = None,
+        video_visible_ranges: list[tuple[int, int]] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -702,13 +697,16 @@ class Qwen3VLModel(nn.Module):
         if pixel_values_videos is not None:
             if video_grid_thw is None:
                 raise ValueError("传了 pixel_values_videos 就要同时传 video_grid_thw")
-            video_embeds, deepstack_video_embeds = self._vision_features_parallel(
-                pixel_values_videos, video_grid_thw)
-            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            video_mask, deepstack_video_embeds = self._place_vision_tokens(
-                input_ids, inputs_embeds, video_embeds, deepstack_video_embeds, "video")
-            if video_mask is not None:
-                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            if (input_ids == self.config.video_token_id).any():
+                video_embeds, deepstack_video_embeds = self._vision_features_parallel(
+                    pixel_values_videos, video_grid_thw)
+                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                video_embeds, deepstack_video_embeds = self._select_visible_rows(
+                    video_embeds, deepstack_video_embeds, video_grid_thw, video_visible_ranges)
+                video_mask, deepstack_video_embeds = self._place_vision_tokens(
+                    input_ids, inputs_embeds, video_embeds, deepstack_video_embeds, "video")
+                if video_mask is not None:
+                    inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         visual_pos_masks = None
         deepstack_visual_embeds = None
@@ -757,7 +755,7 @@ class Qwen3VLModel(nn.Module):
             raise ValueError(
                 f"{name} 特征和占位符对不上: 本步有 {n_tokens} 个占位符,"
                 f"但特征有 {vision_embeds.numel() // inputs_embeds.shape[-1]} 个 token。"
-                "检查 processor 的输入;图片还可能是 image_visible_ranges 算错了")
+                f"检查 processor 的输入;也可能是 {name}_visible_ranges 算错了")
         return mask.unsqueeze(-1).to(inputs_embeds.device), deepstack_embeds
 
 
@@ -785,7 +783,7 @@ class Qwen3VLForCausalLM(nn.Module):
 
     def mm_position_ids(self, seq) -> torch.LongTensor:
         """为一条多模态序列预计算 3D M-RoPE 位置,并把 rope_delta 回填到输入上。"""
-        inputs = seq.inputs
+        inputs = seq.mm_inputs
         assert inputs.mm_token_type_ids is not None, (
             "多模态序列缺少 mm_token_type_ids:processor 要和 input_ids 一起返回它,"
             "M-RoPE 才能算对")

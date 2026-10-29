@@ -14,7 +14,7 @@ from kavor.engine.sequence import Sequence
 from kavor.engine.scheduler import Scheduler
 from kavor.engine.model_runner import ModelRunner
 from kavor.utils.logger import setup_logging
-from .multimodal import ModalInputs
+from .multimodal import ModelInputs
 
 logger = logging.getLogger(__name__)
 
@@ -96,15 +96,17 @@ class LLMEngine:
                 p.join(timeout=2.0)
 
     def build_inputs(self, messages: list[dict], max_pixels: int | None = None,
-                     **template_kwargs) -> ModalInputs:
+                     processor_kwargs: dict | None = None,
+                     **template_kwargs) -> ModelInputs:
         assert self.processor is not None, (
             f"{self.config.model} 没有 processor(AutoProcessor),不支持多模态输入")
-        return ModalInputs.build_inputs(
-            self.tokenizer, self.processor, messages, max_pixels=max_pixels, **template_kwargs)
+        return ModelInputs.build_inputs(
+            self.tokenizer, self.processor, messages, max_pixels=max_pixels,
+            processor_kwargs=processor_kwargs, **template_kwargs)
 
     def add_request(
         self,
-        inputs: ModalInputs,
+        inputs: ModelInputs,
         sampling_params: SamplingParams
     ) -> int:
         if len(inputs.token_ids) > self.config.max_num_batched_tokens:
@@ -136,24 +138,24 @@ class LLMEngine:
     
     def normalize_inputs(
         self, 
-        inputs: list[str] | list[list[int]] | list[ModalInputs]
-    ) -> list[ModalInputs]:
+        inputs: list[str] | list[list[int]] | list[ModelInputs]
+    ) -> list[ModelInputs]:
         normalized = []
         for item in inputs:
-            if isinstance(item, ModalInputs):
+            if isinstance(item, ModelInputs):
                 normalized.append(item)
             elif isinstance(item, str):
                 token_ids = self.tokenizer.encode(item)
-                normalized.append(ModalInputs(token_ids, item))
+                normalized.append(ModelInputs(token_ids, item))
             elif isinstance(item, int):
-                normalized.append(ModalInputs(torch.tensor(item), None))
+                normalized.append(ModelInputs(torch.tensor(item), None))
             else:
                 raise RuntimeError("Not supported data type!")
         return normalized
 
     def generate(
         self,
-        inputs: list[str] | list[list[int]] | list[ModalInputs],
+        inputs: list[str] | list[list[int]] | list[ModelInputs],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:

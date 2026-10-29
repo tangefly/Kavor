@@ -94,7 +94,7 @@ class ModelRunner:
             raise RuntimeError(
                 f"要发给 TP worker 的数据有 {n / 2**20:.1f} MB,超过共享内存 "
                 f"{len(self.shm.buf) / 2**20:.0f} MB:args 里不要夹带大张量"
-                "(多模态的像素张量应该在 ModalInputs.for_workers 里就被丢掉,"
+                "(多模态的像素张量应该在 MMInputs.for_workers 里就被丢掉,"
                 "改走 _scatter_mm 那条 NCCL 数据面)")
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
@@ -139,7 +139,9 @@ class ModelRunner:
                     slot_mapping, None, None, self._padding_slot_ids(num_seqs))
         try:
             logits = self.model.compute_logits(self.model(input_ids, positions))
-            self.sampler(logits, torch.ones(num_seqs, dtype=torch.float32, device="cuda"))
+            # gather 之后只有 rank0 有 logits(见 ParallelLMHead),采样本来也只在 rank0 跑
+            if self.rank == 0:
+                self.sampler(logits, torch.ones(num_seqs, dtype=torch.float32, device="cuda"))
         finally:
             reset_context()
 
@@ -155,7 +157,9 @@ class ModelRunner:
             input_ids = torch.zeros(bs, dtype=torch.int64, device="cuda")
             positions = torch.zeros(bs, dtype=torch.int64, device="cuda")
             logits = self.model.compute_logits(self.model(input_ids, positions))
-            self.sampler(logits, torch.ones(bs, dtype=torch.float32, device="cuda"))
+            # 同 warmup_model:非 0 号 rank 上没有 logits,采样只在 rank0 做
+            if self.rank == 0:
+                self.sampler(logits, torch.ones(bs, dtype=torch.float32, device="cuda"))
         finally:
             reset_context()
 
@@ -384,7 +388,7 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1 + (seq.inputs.rope_delta if seq.inputs is not None else 0))
+            positions.append(len(seq) - 1 + (seq.mm_inputs.rope_delta if seq.mm_inputs is not None else 0))
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -413,49 +417,50 @@ class ModelRunner:
         if not mm_seqs:
             return {}
         kwargs = {}
-        for pixel_key, grid_key in (("pixel_values", "image_grid_thw"),
-                                    ("pixel_values_videos", "video_grid_thw")):
-            grids = [getattr(seq.inputs, grid_key) for seq in mm_seqs
-                     if getattr(seq.inputs, grid_key) is not None]
+        for pixel_key, grid_key, pad_key, ranges_key, name in (
+            ("pixel_values", "image_grid_thw", "image_pad_ranges", "image_visible_ranges", "图片"),
+            ("pixel_values_videos", "video_grid_thw", "video_pad_ranges", "video_visible_ranges", "视频"),
+        ):
+            grids = [getattr(seq.mm_inputs, grid_key) for seq in mm_seqs
+                     if getattr(seq.mm_inputs, grid_key) is not None]
             if not grids:
                 continue
-            pixels = [getattr(seq.inputs, pixel_key) for seq in mm_seqs
-                      if getattr(seq.inputs, pixel_key) is not None]
+            pixels = [getattr(seq.mm_inputs, pixel_key) for seq in mm_seqs
+                      if getattr(seq.mm_inputs, pixel_key) is not None]
             kwargs[grid_key] = torch.cat(grids, dim=0).cuda(non_blocking=True)
             kwargs[pixel_key] = self._scatter_mm(pixels, kwargs[grid_key])
-        if "image_grid_thw" in kwargs:
-            kwargs["image_visible_ranges"] = self._image_visible_ranges(
-                mm_seqs, kwargs["image_grid_thw"])
+            kwargs[ranges_key] = self._visible_ranges(
+                mm_seqs, kwargs[grid_key], pad_key, grid_key, name)
         return kwargs
 
-    def _image_visible_ranges(self, seqs: list[Sequence],
-                              grid: torch.Tensor) -> list[tuple[int, int]] | None:
-        """每张图在本步窗口里可见的特征行 (offset, count);全图都可见时返回 None。"""
+    def _visible_ranges(self, seqs: list[Sequence], grid: torch.Tensor,
+                        pad_key: str, grid_key: str,
+                        name: str) -> list[tuple[int, int]] | None:
         merge_unit = self.config.vision_config.spatial_merge_size ** 2
         ranges, lengths = [], []
         for seq in seqs:
-            inputs = seq.inputs
-            if inputs.image_grid_thw is None:
+            inputs = seq.mm_inputs
+            if getattr(inputs, grid_key) is None:
                 continue
-            rows = (inputs.image_grid_thw.prod(-1) // merge_unit).tolist()
-            pads = inputs.image_pad_ranges
+            rows = (getattr(inputs, grid_key).prod(-1) // merge_unit).tolist()
+            pads = getattr(inputs, pad_key)
             assert pads is not None, (
-                "多模态输入缺少 image_pad_ranges:只有 ModalInputs.build_inputs 会填它,"
-                "手工构造 ModalInputs 时不能直接带 pixel_values")
+                f"多模态输入缺少 {pad_key}:只有 ModelInputs.build_inputs 会填它,"
+                "手工构造 MMInputs 时不能直接带像素张量")
             assert len(pads) == len(rows), (
-                f"image_pad_ranges({pads}) 和 image_grid_thw 的 {len(rows)} 张图对不上")
+                f"{pad_key} 有 {len(pads)} 段,{grid_key} 推出 {len(rows)} 行,对不上")
             start = seq.num_cached_tokens
             end = start + seq.num_scheduled_tokens
             for (pad_start, pad_len), row in zip(pads, rows):
                 assert pad_len == row, (
-                    f"占位符个数 {pad_len} 和 grid 推出的特征行数 {row} 对不上:"
-                    "processor 出的 input_ids 和 grid 不是同一张图")
+                    f"{name}占位符个数 {pad_len} 和 grid 推出的特征行数 {row} 对不上:"
+                    "processor 出的 input_ids 和 grid 不是同一份输入")
                 begin = min(max(start - pad_start, 0), pad_len)
                 finish = min(max(end - pad_start, 0), pad_len)
                 ranges.append((begin, max(finish - begin, 0)))
                 lengths.append(pad_len)
         assert len(ranges) == grid.shape[0], (
-            f"算出 {len(ranges)} 张图,和 image_grid_thw 的 {grid.shape[0]} 行对不上")
+            f"算出 {len(ranges)} 段{name},和 grid 的 {grid.shape[0]} 行对不上")
         if all(count == length for (_, count), length in zip(ranges, lengths)):
             return None
         return ranges

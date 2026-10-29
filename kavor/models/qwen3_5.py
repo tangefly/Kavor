@@ -1190,6 +1190,7 @@ class Qwen3_5Model(nn.Module):
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
         image_visible_ranges: list[tuple[int, int]] | None = None,
+        video_visible_ranges: list[tuple[int, int]] | None = None,
         **kwargs,
     ):
         inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -1206,13 +1207,17 @@ class Qwen3_5Model(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_embeds = self._vision_features_parallel(
-                self.get_video_features, pixel_values_videos, video_grid_thw, **kwargs)
-            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            _, video_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-            )
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            # 本步一段视频占位符都没有(整段视频都在 prefix cache 里):视觉塔不用跑
+            if (input_ids == self.config.video_token_id).any():
+                video_embeds = self._vision_features_parallel(
+                    self.get_video_features, pixel_values_videos, video_grid_thw, **kwargs)
+                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+                video_embeds = self._select_visible_rows(
+                    video_embeds, video_grid_thw, video_visible_ranges)
+                _, video_mask = self.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         position_ids = torch.arange(inputs_embeds.shape[0], device=inputs_embeds.device)
 
@@ -1255,7 +1260,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.model.language_model.linear_padding_slot = value
 
     def mm_position_ids(self, seq) -> torch.LongTensor:
-        inputs = seq.inputs
+        inputs = seq.mm_inputs
         input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long, device="cpu")
         mm_token_type_ids = torch.tensor([inputs.mm_token_type_ids], dtype=torch.long, device="cpu")
         image_grid_thw = None if inputs.image_grid_thw is None else inputs.image_grid_thw.cpu()

@@ -13,7 +13,7 @@ from kavor.engine.async_engine import AsyncEngine
 from kavor.interface.cli import add_server_args
 from kavor.sampling_params import SamplingParams
 from kavor.interface.parser.factory import *
-from kavor.engine.multimodal import ModalInputs
+from kavor.engine.multimodal import ModelInputs
 
 from .request import *
 from .response import *
@@ -174,7 +174,7 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
             **(req.chat_template_kwargs or {}),
         }
         
-        prompt = ModalInputs.build_inputs(
+        prompt = ModelInputs.build_inputs(
             app.state.engine.tokenizer,
             app.state.engine.processor,
             messages,

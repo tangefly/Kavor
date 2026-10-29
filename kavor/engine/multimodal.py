@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 import base64
 import io
+import json
+import subprocess
+import tempfile
 import urllib.request
 import hashlib
 
@@ -10,33 +13,41 @@ from PIL import Image
 
 
 MAX_IMAGE_BYTES = 32 * 2**20
+MAX_VIDEO_BYTES = 64 * 2**20
 
 @dataclass
-class ModalInputs:
+class MMInputs:
+    """一条序列的多模态输入:processor 产出的像素/网格 + 引擎算出来的占位符区间。"""
 
-    token_ids: list[int]
-    prompt: str
     mm_token_type_ids: list[int] | None = None
     pixel_values: torch.Tensor | None = None
     image_grid_thw: torch.Tensor | None = None
     pixel_values_videos: torch.Tensor | None = None
     video_grid_thw: torch.Tensor | None = None
-    image_hash_id: bytes | int = -1
-    image_pad_ranges: list[tuple[int, int]] | None = None   # prompt 里每张图的 (起点, 占位符个数)
-    rope_delta: int = 0                             # prefill 时由模型回填,解码步的位置要加它
-    
-    def for_workers(self, prefill: bool) -> "ModalInputs":
+    mm_hash_id: bytes | int = -1
+    image_pad_ranges: list[tuple[int, int]] | None = None
+    video_pad_ranges: list[tuple[int, int]] | None = None
+    rope_delta: int = 0
+
+    def for_workers(self, prefill: bool) -> "MMInputs":
         if prefill:
-            return ModalInputs(
-                token_ids=[],
-                prompt="",
+            return MMInputs(
                 mm_token_type_ids=self.mm_token_type_ids,
                 image_grid_thw=self.image_grid_thw,
                 video_grid_thw=self.video_grid_thw,
                 image_pad_ranges=self.image_pad_ranges,     # TP worker 也要算分块偏移
+                video_pad_ranges=self.video_pad_ranges,
                 rope_delta=self.rope_delta,
             )
-        return ModalInputs(token_ids=[], prompt="", rope_delta=self.rope_delta)
+        return MMInputs(rope_delta=self.rope_delta)
+
+
+@dataclass
+class ModelInputs:
+
+    token_ids: list[int]
+    prompt: str
+    mm_inputs: MMInputs | None = None
 
     @classmethod
     def build_inputs(
@@ -45,48 +56,46 @@ class ModalInputs:
         processor,
         messages: list[dict],
         max_pixels: int | None = None,
+        processor_kwargs: dict | None = None,
         **template_kwargs,
-    ) -> "ModalInputs":
-        """messages 是 OpenAI 风格的原始消息(可以混着 str 和 list 两种 content)。
-        template_kwargs 直接转给 apply_chat_template(比如 tools=...)。
-        """
+    ) -> "ModelInputs":
         messages, images, videos = normalize_content(messages)
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, **template_kwargs)
         if processor:
-            prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, **template_kwargs)
+            mm_kwargs = {"return_tensors": "pt"}
+            if max_pixels:
+                mm_kwargs["images_kwargs"] = {"max_pixels": max_pixels}
+            mm_kwargs.update(processor_kwargs or {})
             inputs = processor(
                 text=prompt,
                 images=images or None,
                 videos=videos or None,
-                return_tensors="pt",
-                **({"images_kwargs": {"max_pixels": max_pixels}} if max_pixels else {}),
+                **mm_kwargs,
             )
             _check_placeholders(inputs, processor, len(images), len(videos))
-            return cls(
-                token_ids=inputs["input_ids"][0].tolist(),
-                prompt=prompt,
-                mm_token_type_ids=inputs["mm_token_type_ids"][0].tolist(),
-                pixel_values=inputs.get("pixel_values"),
-                image_grid_thw=inputs.get("image_grid_thw"),
-                pixel_values_videos=inputs.get("pixel_values_videos"),
-                video_grid_thw=inputs.get("video_grid_thw"),
-                image_hash_id=cls.hash_images(inputs.get("pixel_values"), inputs.get("image_grid_thw")),
-                image_pad_ranges=find_image_pad_ranges(
-                    inputs["input_ids"][0], processor.image_token_id)
-            )
-        else:
-            prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, **template_kwargs)
-            inputs = tokenizer(prompt, return_tensors="pt")
-            return cls(
-                token_ids=inputs["input_ids"][0].tolist(),
-                prompt=prompt,
-            )
+            token_ids = inputs["input_ids"][0]
+            mm_inputs = None
+            if images or videos:
+                mm_inputs = MMInputs(
+                    mm_token_type_ids=inputs["mm_token_type_ids"][0].tolist(),
+                    pixel_values=inputs.get("pixel_values"),
+                    image_grid_thw=inputs.get("image_grid_thw"),
+                    pixel_values_videos=inputs.get("pixel_values_videos"),
+                    video_grid_thw=split_video_grid(inputs.get("video_grid_thw")),
+                    mm_hash_id=cls.hash_media(inputs),
+                    image_pad_ranges=find_pad_ranges(token_ids, processor.image_token_id),
+                    video_pad_ranges=find_pad_ranges(token_ids, processor.video_token_id),
+                )
+            return cls(token_ids=token_ids.tolist(), prompt=prompt, mm_inputs=mm_inputs)
+        inputs = tokenizer(prompt, return_tensors="pt")
+        return cls(token_ids=inputs["input_ids"][0].tolist(), prompt=prompt)
     
     @classmethod
-    def hash_images(cls, pixel_values, image_grid_thw):
+    def hash_media(cls, inputs: dict) -> bytes:
         digest = hashlib.sha256()
-        for tensor in (pixel_values, image_grid_thw):
+        for key in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"):
+            tensor = inputs.get(key)
             if tensor is None:
                 digest.update(b"none")
                 continue
@@ -95,10 +104,19 @@ class ModalInputs:
             digest.update(repr(tuple(tensor.shape)).encode())
             digest.update(tensor.reshape(-1).view(torch.uint8).numpy())
         return digest.digest()
-    
-def find_image_pad_ranges(token_ids, image_pad_token_id):
+
+
+def split_video_grid(video_grid_thw: torch.Tensor | None) -> torch.Tensor | None:
+    if video_grid_thw is None:
+        return None
+    rows = video_grid_thw.repeat_interleave(video_grid_thw[:, 0], dim=0)
+    rows[:, 0] = 1
+    return rows
+
+
+def find_pad_ranges(token_ids, pad_token_id):
     tokens = torch.as_tensor(token_ids)
-    mask = tokens == image_pad_token_id
+    mask = tokens == pad_token_id
 
     start_mask = mask.clone()
     start_mask[1:] &= ~mask[:-1]
@@ -237,8 +255,9 @@ def _fetch_url(url: str) -> Image.Image:
 def load_video(src):
     """视频 → 帧列表。已经是帧数组的直接返回。
 
-    这个环境里 torchcodec / decord / av / cv2 一个都没有(transformers 的 fetch_videos
-    固定走 torchcodec),所以 URL 和路径现在解不了,只能由调用方解好帧再传。
+    data:video/...;base64,... 先落到临时文件,再交给 ffmpeg 解码(见
+    video_frames_from_path)。本地路径和 file:// 一律拒绝 —— 这是对外的 HTTP 服务,
+    放开路径等于把服务器变成任意文件读取器。
     """
     if isinstance(src, np.ndarray):
         if src.ndim == 4:       # (T, H, W, 3)
@@ -246,10 +265,64 @@ def load_video(src):
         raise ValueError(f"帧数组应该是 (T, H, W, 3),收到 {src.shape}")
     if isinstance(src, (list, tuple)):
         return list(src)
+    if isinstance(src, str) and src.startswith("data:"):
+        head, _, b64 = src.partition(",")
+        if not b64 or "base64" not in head:
+            raise ValueError(f"只支持 base64 编码的 data URL: {head[:48]}")
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception as e:
+            raise ValueError(f"data URL 的 base64 解码失败: {e}") from e
+        if len(raw) > MAX_VIDEO_BYTES:
+            raise ValueError(f"视频超过 {MAX_VIDEO_BYTES // 2**20} MiB 上限")
+        # 容器后缀只影响 ffmpeg 的探测顺序,内容还是靠 probe
+        suffix = "." + (head[5:].rpartition("/")[2].partition(";")[0] or "mp4")
+        with tempfile.NamedTemporaryFile(suffix=suffix) as f:
+            f.write(raw)
+            f.flush()
+            return video_frames_from_path(f.name)
     raise ValueError(
-        "视频解码不可用:环境里没有 torchcodec/decord/av/cv2。"
-        "请先把视频解码成帧列表([np.ndarray(H,W,3)] 或 (T,H,W,3) 数组)再传,"
-        "或 `pip install torchcodec` 后改用 video_url")
+        "不支持的视频地址(只认 base64 data URL)。"
+        "请先把视频解码成帧列表([np.ndarray(H,W,3)] 或 (T,H,W,3) 数组)再传;"
+        "本地脚本可以直接用 video_frames_from_path(path) 走 ffmpeg 解码")
+
+
+def probe_video(path: str) -> dict:
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+             "-of", "json", path],
+            capture_output=True, check=True, text=True)
+    except FileNotFoundError as e:
+        raise RuntimeError("读本地视频需要 ffprobe/ffmpeg(解码视频帧)") from e
+    stream = json.loads(probe.stdout)["streams"][0]
+    num, _, den = stream["r_frame_rate"].partition("/")      # "30/1"
+    return {
+        "width": int(stream["width"]),
+        "height": int(stream["height"]),
+        "fps": float(num) / float(den or 1),
+        "num_frames": int(stream.get("nb_frames") or 0),
+    }
+
+
+def video_frames_from_path(path: str, max_frames: int | None = None) -> list[np.ndarray]:
+    info = probe_video(path)
+    width, height = info["width"], info["height"]
+
+    try:
+        raw = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            capture_output=True, check=True).stdout
+    except FileNotFoundError as e:
+        raise RuntimeError("读本地视频需要 ffmpeg(解码视频帧)") from e
+
+    frame_bytes = width * height * 3
+    frames = np.frombuffer(raw, dtype=np.uint8)
+    frames = frames[: len(frames) // frame_bytes * frame_bytes].reshape(-1, height, width, 3)
+    if max_frames is not None:
+        frames = frames[:max_frames]
+    return [frame.copy() for frame in frames]
 
 
 def _check_placeholders(inputs: dict, processor, n_images: int, n_videos: int):
