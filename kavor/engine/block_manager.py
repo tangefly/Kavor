@@ -2,7 +2,6 @@ from collections import deque
 import pickle, hashlib
 
 from kavor.engine.sequence import Sequence
-from kavor.utils.logger import logger
 
 NONE_HASH = -1
 
@@ -118,14 +117,6 @@ class BlockManager:
         if self.enable_prefix_cache:
             self.prefix_cache_hit_tokens += cached_tokens
             self.prefix_cache_prompt_tokens += seq.num_tokens
-            logger.info(
-                "prefix cache: seq %d 命中 %d/%d tokens (%.1f%%),"
-                " 累计 %d/%d tokens (%.1f%%)",
-                seq.seq_id, cached_tokens, seq.num_tokens,
-                100.0 * cached_tokens / seq.num_tokens,
-                self.prefix_cache_hit_tokens, self.prefix_cache_prompt_tokens,
-                100.0 * self.prefix_cache_hit_tokens / self.prefix_cache_prompt_tokens,
-            )
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):

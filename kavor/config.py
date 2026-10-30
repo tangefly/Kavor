@@ -20,6 +20,8 @@ class Config:
     max_num_seqs: int = 512
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
+    enable_mm_cache: bool = False
+    mm_cache_size_gb: float = 1.0
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     trust_remote_code: bool = False
@@ -38,6 +40,7 @@ class Config:
             raise RuntimeError(f"Model not found: {self.model}")
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.mm_cache_size_gb >= 0, "mm_cache_size_gb 不能为负"
         self.rdzv_port = self.rdzv_port if self.rdzv_port > 0 else free_port()
         self.hf_config = AutoConfig.from_pretrained(self.model)
         if getattr(self.hf_config, "vision_config", None):

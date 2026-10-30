@@ -9,11 +9,6 @@ client = OpenAI(
     api_key="EMPTY",
 )
 
-REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VIDEO_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    REPO_DIR, "examples/data/bbb_3s_720p.mp4")
-
-
 # 视频转 base64
 def encode_video(video_path):
     with open(video_path, "rb") as f:
@@ -24,7 +19,7 @@ def encode_image(image_path):
         return base64.b64encode(f.read()).decode("utf-8")
 
 image_base64 = encode_image("./data/command.png")
-video_base64 = encode_video(VIDEO_PATH)
+video_base64 = encode_video("./data/bbb_3s_720p.mp4")
 
 response = client.chat.completions.create(
     model="Qwen3-VL-4B-Instruct",

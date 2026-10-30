@@ -13,6 +13,12 @@ def add_server_args(parser: argparse.ArgumentParser):
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument(
+        "--enable-mm-cache", action="store_true",
+        help="启用多模态 embedding 缓存:同一张图/同一段视频跨请求复用视觉塔输出")
+    parser.add_argument(
+        "--mm-cache-size-gb", type=float, default=1.0,
+        help="mm embedding 缓存池大小(GiB),在 KV 池之前预留;0 表示不占显存")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
         "--trust-remote-code", action="store_true",

@@ -1,49 +1,124 @@
 from dataclasses import dataclass
-import base64
-import io
-import json
-import subprocess
-import tempfile
-import urllib.request
 import hashlib
 
-import numpy as np
 import torch
-from PIL import Image
+
+from kavor.engine.media_io import normalize_messages
 
 
-MAX_IMAGE_BYTES = 32 * 2**20
-MAX_VIDEO_BYTES = 64 * 2**20
+@dataclass
+class MediaItem:
+    """一个媒体(图片/视频)在 grid、pixel 张量里的位置,以及内容哈希。"""
+
+    hash_id: bytes
+    embed_rows: int     # merge 后的视觉 token 数 = 缓存行数
+    grid_start: int     # 在(视频拆帧后的)grid 张量里的起始行
+    grid_rows: int      # 占用的 grid 行数:图片 1,视频 = 时域 patch 数
+    pixel_start: int    # 在 pixel 张量里的起始行
+    pixel_rows: int     # 占用的 pixel 行数:图片 prod(thw),视频 t*h*w
+
+
+def build_media_items(
+    pixel_values: torch.Tensor | None,
+    grid_thw: torch.Tensor | None,
+    merge_unit: int,
+    *,
+    split_video: bool = False,
+) -> list[MediaItem]:
+    if grid_thw is None or pixel_values is None:
+        return []
+    items = []
+    pixel_start = 0
+    grid_start = 0
+    for row in grid_thw:
+        t, h, w = (int(value) for value in row.tolist())
+        pixel_rows = t * h * w
+        # 图片的 grid 张量一行就是一张图;视频拆帧后一行是一帧
+        grid_rows = t if split_video else 1
+        assert pixel_rows > 0, f"非法的 grid {row.tolist()}"
+        digest = hashlib.sha256()
+        digest.update(b"video" if split_video else b"image")
+        slice_ = pixel_values[pixel_start:pixel_start + pixel_rows]
+        digest.update(slice_.detach().to("cpu").contiguous().view(torch.uint8).numpy())
+        digest.update(row.detach().to("cpu").contiguous().view(torch.uint8).numpy())
+        items.append(MediaItem(
+            hash_id=digest.digest(),
+            embed_rows=pixel_rows // merge_unit,
+            grid_start=grid_start,
+            grid_rows=grid_rows,
+            pixel_start=pixel_start,
+            pixel_rows=pixel_rows,
+        ))
+        pixel_start += pixel_rows
+        grid_start += grid_rows
+    assert pixel_start == pixel_values.shape[0], (
+        f"pixel 行数 {pixel_values.shape[0]} 和 grid 推出的 {pixel_start} 对不上")
+    return items
+
+
+def request_media_hash(image_items: list[MediaItem], video_items: list[MediaItem]) -> bytes:
+    """请求级媒体摘要(prefix cache 的块哈希用),由 per-media id 依次拼出来。"""
+    digest = hashlib.sha256()
+    for item in image_items + video_items:
+        digest.update(item.hash_id)
+    return digest.digest()
+
+
+def placeholder_positions(placeholder_runs) -> list[int]:
+    """把 [(start, len), ...] 展开成占位符在 prompt 里的位置列表(升序)。"""
+    positions = []
+    for placeholder_start, placeholder_len in placeholder_runs:
+        positions.extend(range(placeholder_start, placeholder_start + placeholder_len))
+    return positions
+
+
+@dataclass
+class ModalityInputs:
+    """一种模态的 processor 输出 + 引擎侧的位置/身份簿记。
+
+    placeholder_runs 与 items 一一对应:第 i 段占位符属于第 i 个媒体项。
+    """
+
+    pixel_values: torch.Tensor | None = None
+    grid_thw: torch.Tensor | None = None
+    placeholder_runs: list[tuple[int, int]] | None = None
+    items: list[MediaItem] | None = None
+
+    def for_workers(self, prefill: bool) -> "ModalityInputs":
+        if not prefill:
+            return ModalityInputs()
+        # 像素只留在 rank0;TP worker 需要每媒体 id 才能做出同样的缓存决策
+        return ModalityInputs(
+            grid_thw=self.grid_thw,
+            placeholder_runs=self.placeholder_runs,
+            items=self.items,
+        )
+
 
 @dataclass
 class MMInputs:
-    """一条序列的多模态输入:processor 产出的像素/网格 + 引擎算出来的占位符区间。"""
+    """一条序列的多模态输入:每种模态的 processor 输出 + 引擎簿记,再加 M-RoPE 状态。"""
 
     mm_token_type_ids: list[int] | None = None
-    pixel_values: torch.Tensor | None = None
-    image_grid_thw: torch.Tensor | None = None
-    pixel_values_videos: torch.Tensor | None = None
-    video_grid_thw: torch.Tensor | None = None
+    image: ModalityInputs | None = None
+    video: ModalityInputs | None = None
     mm_hash_id: bytes | int = -1
-    image_pad_ranges: list[tuple[int, int]] | None = None
-    video_pad_ranges: list[tuple[int, int]] | None = None
     rope_delta: int = 0
 
     def for_workers(self, prefill: bool) -> "MMInputs":
-        if prefill:
-            return MMInputs(
-                mm_token_type_ids=self.mm_token_type_ids,
-                image_grid_thw=self.image_grid_thw,
-                video_grid_thw=self.video_grid_thw,
-                image_pad_ranges=self.image_pad_ranges,     # TP worker 也要算分块偏移
-                video_pad_ranges=self.video_pad_ranges,
-                rope_delta=self.rope_delta,
-            )
-        return MMInputs(rope_delta=self.rope_delta)
+        if not prefill:
+            return MMInputs(rope_delta=self.rope_delta)
+        return MMInputs(
+            mm_token_type_ids=self.mm_token_type_ids,
+            image=None if self.image is None else self.image.for_workers(prefill=True),
+            video=None if self.video is None else self.video.for_workers(prefill=True),
+            rope_delta=self.rope_delta,
+        )
 
 
 @dataclass
-class ModelInputs:
+class PromptInputs:
+    """一次请求的 prompt:token ids + 文本,以及可选的 multimodal 载荷。"""
 
     token_ids: list[int]
     prompt: str
@@ -58,8 +133,8 @@ class ModelInputs:
         max_pixels: int | None = None,
         processor_kwargs: dict | None = None,
         **template_kwargs,
-    ) -> "ModelInputs":
-        messages, images, videos = normalize_content(messages)
+    ) -> "PromptInputs":
+        messages, images, videos = normalize_messages(messages)
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, **template_kwargs)
         if processor:
@@ -73,40 +148,47 @@ class ModelInputs:
                 videos=videos or None,
                 **mm_kwargs,
             )
-            _check_placeholders(inputs, processor, len(images), len(videos))
             token_ids = inputs["input_ids"][0]
             mm_inputs = None
             if images or videos:
+                # build_media_items 拿的是未拆分的 video grid,拆帧发生在 MMInputs 里
+                merge_unit = processor.image_processor.merge_size ** 2
+                image_items = build_media_items(
+                    inputs.get("pixel_values"), inputs.get("image_grid_thw"), merge_unit)
+                video_items = build_media_items(
+                    inputs.get("pixel_values_videos"), inputs.get("video_grid_thw"),
+                    merge_unit, split_video=True)
                 mm_inputs = MMInputs(
                     mm_token_type_ids=inputs["mm_token_type_ids"][0].tolist(),
-                    pixel_values=inputs.get("pixel_values"),
-                    image_grid_thw=inputs.get("image_grid_thw"),
-                    pixel_values_videos=inputs.get("pixel_values_videos"),
-                    video_grid_thw=split_video_grid(inputs.get("video_grid_thw")),
-                    mm_hash_id=cls.hash_media(inputs),
-                    image_pad_ranges=find_pad_ranges(token_ids, processor.image_token_id),
-                    video_pad_ranges=find_pad_ranges(token_ids, processor.video_token_id),
+                    image=ModalityInputs(
+                        pixel_values=inputs.get("pixel_values"),
+                        grid_thw=inputs.get("image_grid_thw"),
+                        placeholder_runs=find_placeholder_runs(
+                            token_ids, processor.image_token_id),
+                        items=image_items,
+                    ) if image_items else None,
+                    video=ModalityInputs(
+                        pixel_values=inputs.get("pixel_values_videos"),
+                        grid_thw=split_video_grid(inputs.get("video_grid_thw")),
+                        placeholder_runs=find_placeholder_runs(
+                            token_ids, processor.video_token_id),
+                        items=video_items,
+                    ) if video_items else None,
+                    mm_hash_id=request_media_hash(image_items, video_items),
                 )
             return cls(token_ids=token_ids.tolist(), prompt=prompt, mm_inputs=mm_inputs)
         inputs = tokenizer(prompt, return_tensors="pt")
         return cls(token_ids=inputs["input_ids"][0].tolist(), prompt=prompt)
-    
-    @classmethod
-    def hash_media(cls, inputs: dict) -> bytes:
-        digest = hashlib.sha256()
-        for key in ("pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"):
-            tensor = inputs.get(key)
-            if tensor is None:
-                digest.update(b"none")
-                continue
-            tensor = tensor.detach().to("cpu").contiguous()
-            digest.update(str(tensor.dtype).encode())
-            digest.update(repr(tuple(tensor.shape)).encode())
-            digest.update(tensor.reshape(-1).view(torch.uint8).numpy())
-        return digest.digest()
 
 
 def split_video_grid(video_grid_thw: torch.Tensor | None) -> torch.Tensor | None:
+    """Expand each video row (T, H, W) into T rows of (1, H, W).
+
+    (num_videos, 3) -> (sum(T), 3): one grid row per temporal patch, matching the
+    one <|video_pad|> run per patch in the prompt. Pixel rows are already ordered
+    t-major, so row order is preserved and the per-frame vision attention sees
+    the same layout.
+    """
     if video_grid_thw is None:
         return None
     rows = video_grid_thw.repeat_interleave(video_grid_thw[:, 0], dim=0)
@@ -114,9 +196,9 @@ def split_video_grid(video_grid_thw: torch.Tensor | None) -> torch.Tensor | None
     return rows
 
 
-def find_pad_ranges(token_ids, pad_token_id):
+def find_placeholder_runs(token_ids, placeholder_token_id):
     tokens = torch.as_tensor(token_ids)
-    mask = tokens == pad_token_id
+    mask = tokens == placeholder_token_id
 
     start_mask = mask.clone()
     start_mask[1:] &= ~mask[:-1]
@@ -129,223 +211,5 @@ def find_pad_ranges(token_ids, pad_token_id):
 
     lengths = [end - start + 1 for start, end in zip(starts, ends)]
 
-    ranges = list(zip(starts, lengths))
-    return ranges
-
-def _content_of(message):
-    """消息可能是 dict(库内调用),也可能是 pydantic 模型(API 层),两种都要能取到 content。"""
-    if isinstance(message, dict):
-        return message.get("content")
-    return getattr(message, "content", None)
-
-
-def has_media(messages: list[dict]) -> bool:
-    """请求里有没有图/视频 —— API 层用它决定走不走多模态分支。
-
-    文本消息的 content 是 str,这里必须能安全地跳过(不能直接 for item in content)。
-    """
-    for message in messages:
-        content = _content_of(message)
-        if not isinstance(content, (list, tuple)):
-            continue
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            if "image" in item or "image_url" in item or item.get("type") in ("image", "image_url", "input_image"):
-                return True
-            if "video" in item or item.get("type") in ("video", "video_url"):
-                return True
-    return False
-
-
-def normalize_content(messages: list[dict]) -> tuple[list[dict], list[Image.Image], list]:
-    """洗消息 + 抽媒体,返回 (给模板用的 messages, images, videos)。
-
-    模板的判定逻辑只看 key 存不存在(值被忽略),真正喂给 processor 的是这里抽出来的对象。
-    支持这几种写法:
-      {"type": "image_url", "image_url": {"url": ...}}    OpenAI / vLLM 标准
-      {"type": "image",     "image": ...}                 Qwen 原生
-      {"type": "video_url", "video_url": {"url": ...}}    vLLM(模板不认,这里转成 "video")
-      {"type": "video",     "video": ...}                 Qwen 原生
-    其它 item(type=="text" 或带 "text" 键)原样保留。
-    """
-    out_messages: list[dict] = []
-    images: list[Image.Image] = []
-    videos: list = []
-
-    for message in messages:
-        content = message.get("content")
-        if not isinstance(content, (list, tuple)):
-            out_messages.append(dict(message))      # 纯字符串 content,原样过
-            continue
-
-        new_content: list[dict] = []
-        for item in content:
-            if not isinstance(item, dict):
-                new_content.append(item)
-                continue
-
-            if "image_url" in item or item.get("type") in ("image", "image_url", "input_image"):
-                src = item.get("image_url") or item.get("image") or item.get("input_image")
-                if isinstance(src, dict):
-                    src = src.get("url")
-                image = load_image(src)
-                images.append(image)
-                new_content.append({"type": "image", "image": image})
-            elif "video_url" in item or item.get("type") in ("video", "video_url"):
-                src = item.get("video_url") or item.get("video")
-                if isinstance(src, dict):
-                    src = src.get("url")
-                frames = load_video(src)
-                videos.append(frames)
-                new_content.append({"type": "video", "video": frames})
-            else:
-                new_content.append(item)
-
-        out_messages.append({**message, "content": new_content})
-
-    return out_messages, images, videos
-
-
-def load_image(src) -> Image.Image:
-    """data:image/png;base64,... / http(s):// → PIL.Image(RGB)。已经是 PIL 的直接返回。
-
-    只放行这两种:本地路径和 file:// 一律拒绝 —— 这是对外的 HTTP 服务,放开路径
-    等于把服务器变成任意文件读取器。
-    """
-    if isinstance(src, Image.Image):
-        return src.convert("RGB")
-    if not isinstance(src, str):
-        raise ValueError(f"看不懂的图片输入: {type(src).__name__}")
-
-    if src.startswith("data:"):
-        head, _, b64 = src.partition(",")
-        if not b64 or "base64" not in head:
-            raise ValueError(f"只支持 base64 编码的 data URL: {head[:48]}")
-        try:
-            raw = base64.b64decode(b64, validate=True)
-        except Exception as e:
-            raise ValueError(f"data URL 的 base64 解码失败: {e}") from e
-        return Image.open(io.BytesIO(raw)).convert("RGB")
-
-    if src.startswith(("http://", "https://")):
-        return _fetch_url(src)
-
-    raise ValueError(f"不支持的图片地址(只认 data: 和 http(s)://): {src[:64]}")
-
-
-def image_from_path(path: str) -> Image.Image:
-    """本地文件 → PIL.Image,给可信调用方(命令行/脚本)用。
-
-    写进请求体里的本地路径仍然被 load_image 拒绝:对外服务放开路径等于任意文件读取。
-    """
-    return Image.open(path).convert("RGB")
-
-
-def _fetch_url(url: str) -> Image.Image:
-    # 走 stdlib,不引额外依赖。注意:这里会去访问任意 URL,只适合内网可信部署。
-    request = urllib.request.Request(url, headers={"User-Agent": "kavor"})
-    with urllib.request.urlopen(request, timeout=10) as response:      # noqa: S310
-        raw = response.read(MAX_IMAGE_BYTES + 1)
-    if len(raw) > MAX_IMAGE_BYTES:
-        raise ValueError(f"图片超过 {MAX_IMAGE_BYTES // 2**20} MiB 上限")
-    return Image.open(io.BytesIO(raw)).convert("RGB")
-
-
-def load_video(src):
-    """视频 → 帧列表。已经是帧数组的直接返回。
-
-    data:video/...;base64,... 先落到临时文件,再交给 ffmpeg 解码(见
-    video_frames_from_path)。本地路径和 file:// 一律拒绝 —— 这是对外的 HTTP 服务,
-    放开路径等于把服务器变成任意文件读取器。
-    """
-    if isinstance(src, np.ndarray):
-        if src.ndim == 4:       # (T, H, W, 3)
-            return list(src)
-        raise ValueError(f"帧数组应该是 (T, H, W, 3),收到 {src.shape}")
-    if isinstance(src, (list, tuple)):
-        return list(src)
-    if isinstance(src, str) and src.startswith("data:"):
-        head, _, b64 = src.partition(",")
-        if not b64 or "base64" not in head:
-            raise ValueError(f"只支持 base64 编码的 data URL: {head[:48]}")
-        try:
-            raw = base64.b64decode(b64, validate=True)
-        except Exception as e:
-            raise ValueError(f"data URL 的 base64 解码失败: {e}") from e
-        if len(raw) > MAX_VIDEO_BYTES:
-            raise ValueError(f"视频超过 {MAX_VIDEO_BYTES // 2**20} MiB 上限")
-        # 容器后缀只影响 ffmpeg 的探测顺序,内容还是靠 probe
-        suffix = "." + (head[5:].rpartition("/")[2].partition(";")[0] or "mp4")
-        with tempfile.NamedTemporaryFile(suffix=suffix) as f:
-            f.write(raw)
-            f.flush()
-            return video_frames_from_path(f.name)
-    raise ValueError(
-        "不支持的视频地址(只认 base64 data URL)。"
-        "请先把视频解码成帧列表([np.ndarray(H,W,3)] 或 (T,H,W,3) 数组)再传;"
-        "本地脚本可以直接用 video_frames_from_path(path) 走 ffmpeg 解码")
-
-
-def probe_video(path: str) -> dict:
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
-             "-of", "json", path],
-            capture_output=True, check=True, text=True)
-    except FileNotFoundError as e:
-        raise RuntimeError("读本地视频需要 ffprobe/ffmpeg(解码视频帧)") from e
-    stream = json.loads(probe.stdout)["streams"][0]
-    num, _, den = stream["r_frame_rate"].partition("/")      # "30/1"
-    return {
-        "width": int(stream["width"]),
-        "height": int(stream["height"]),
-        "fps": float(num) / float(den or 1),
-        "num_frames": int(stream.get("nb_frames") or 0),
-    }
-
-
-def video_frames_from_path(path: str, max_frames: int | None = None) -> list[np.ndarray]:
-    info = probe_video(path)
-    width, height = info["width"], info["height"]
-
-    try:
-        raw = subprocess.run(
-            ["ffmpeg", "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-            capture_output=True, check=True).stdout
-    except FileNotFoundError as e:
-        raise RuntimeError("读本地视频需要 ffmpeg(解码视频帧)") from e
-
-    frame_bytes = width * height * 3
-    frames = np.frombuffer(raw, dtype=np.uint8)
-    frames = frames[: len(frames) // frame_bytes * frame_bytes].reshape(-1, height, width, 3)
-    if max_frames is not None:
-        frames = frames[:max_frames]
-    return [frame.copy() for frame in frames]
-
-
-def _check_placeholders(inputs: dict, processor, n_images: int, n_videos: int):
-    """文本占位符数 == grid 推出来的 token 数,且张数 == 请求里的媒体数。
-
-    两处不匹配时 processor 都不报错(多给的图被静默丢弃、文本里没占位符的图直接消失),
-    模型只会拿到对不上的输入然后答错,所以必须在这里拦。
-    """
-    merge = processor.image_processor.merge_size ** 2
-    for token_id, grid_key, n_given, name in (
-        (processor.image_token_id, "image_grid_thw", n_images, "图片"),
-        (processor.video_token_id, "video_grid_thw", n_videos, "视频"),
-    ):
-        grid = inputs.get(grid_key)
-        if grid is None:
-            if n_given:
-                raise ValueError(f"请求里有 {n_given} 个{name},但 processor 没有产出 {grid_key}")
-            continue
-        n_pad = int((inputs["input_ids"][0] == token_id).sum())
-        n_from_grid = int(grid.prod(-1).sum() // merge)
-        if n_pad != n_from_grid:
-            raise ValueError(
-                f"{name} token 对不上: input_ids 里 {n_pad} 个, grid 推出 {n_from_grid} 个"
-                "(多半是模板没渲染出占位符,或用了截断)")
-        if grid.shape[0] != n_given:
-            raise ValueError(f"{name}张数对不上: 请求里 {n_given} 个, processor 只处理了 {grid.shape[0]} 个")
+    runs = list(zip(starts, lengths))
+    return runs

@@ -1058,6 +1058,11 @@ class Qwen3_5Model(nn.Module):
 
         return image_embeds
 
+    def get_mm_embeddings(self, pixel_values, grid_thw, modality: str = "image"):
+        """引擎侧缓存接口:只跑视觉塔。Qwen3_5 没有 deepstack,第二项恒为空列表。"""
+        get_features = self.get_video_features if modality == "video" else self.get_image_features
+        return self._vision_features_parallel(get_features, pixel_values, grid_thw), []
+
     def _vision_features_parallel(self, get_features, pixel_values, grid_thw, **kwargs) -> torch.Tensor:
         world = dist.get_world_size()
         rank = dist.get_rank()
@@ -1191,11 +1196,21 @@ class Qwen3_5Model(nn.Module):
         video_grid_thw: torch.LongTensor | None = None,
         image_visible_ranges: list[tuple[int, int]] | None = None,
         video_visible_ranges: list[tuple[int, int]] | None = None,
+        image_embeds: torch.Tensor | None = None,
+        video_embeds: torch.Tensor | None = None,
+        deepstack_image_embeds=None,       # 统一接口占位;Qwen3_5 没有 deepstack
+        deepstack_video_embeds=None,
         **kwargs,
     ):
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
-        if pixel_values is not None:
+        if image_embeds is not None:
+            # 引擎侧 mm cache 拼好的特征,视觉塔已经跑过了
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        elif pixel_values is not None:
             image_embeds = self._vision_features_parallel(
                 self.get_image_features, pixel_values, image_grid_thw, **kwargs)
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -1206,7 +1221,12 @@ class Qwen3_5Model(nn.Module):
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        if pixel_values_videos is not None:
+        if video_embeds is not None:
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        elif pixel_values_videos is not None:
             # 本步一段视频占位符都没有(整段视频都在 prefix cache 里):视觉塔不用跑
             if (input_ids == self.config.video_token_id).any():
                 video_embeds = self._vision_features_parallel(
@@ -1250,6 +1270,10 @@ class Qwen3_5ForCausalLM(nn.Module):
     def mm_pixel_dtype(self):
         return self.model.visual.patch_embed.proj.weight.dtype
 
+    def get_mm_embeddings(self, pixel_values, grid_thw, modality: str = "image"):
+        """给 ModelRunner 的 mm cache 用:只算视觉塔,不做占位符填充。"""
+        return self.model.get_mm_embeddings(pixel_values, grid_thw, modality)
+
     @property
     def linear_padding_slot(self) -> int | None:
         """线性注意力状态池的占位块 id(模型没有线性注意力层时为 None),见 Qwen3_5TextModel。"""
@@ -1263,8 +1287,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         inputs = seq.mm_inputs
         input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long, device="cpu")
         mm_token_type_ids = torch.tensor([inputs.mm_token_type_ids], dtype=torch.long, device="cpu")
-        image_grid_thw = None if inputs.image_grid_thw is None else inputs.image_grid_thw.cpu()
-        video_grid_thw = None if inputs.video_grid_thw is None else inputs.video_grid_thw.cpu().clone()
+        image_grid_thw = (None if inputs.image is None or inputs.image.grid_thw is None
+                          else inputs.image.grid_thw.cpu())
+        video_grid_thw = (None if inputs.video is None or inputs.video.grid_thw is None
+                          else inputs.video.grid_thw.cpu().clone())
         positions, deltas = self.model.get_rope_index(
             input_ids,
             mm_token_type_ids,

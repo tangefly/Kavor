@@ -46,6 +46,9 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate_prefill(seq, num_cached_blocks)
+                seq.stats.mark_prefill_start()
+                if self.block_manager.enable_prefix_cache:
+                    seq.stats.record_prefix_cache(seq.num_cached_tokens)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:

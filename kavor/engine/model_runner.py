@@ -8,11 +8,12 @@ from tqdm.auto import tqdm
 
 from kavor.config import Config
 from kavor.engine.cache_pool import CachePool
+from kavor.engine.mm_cache import MMCache
+from kavor.engine.mm_assembler import MMInputAssembler
 from kavor.engine.sequence import Sequence
 from kavor.layers.sampler import Sampler
 from kavor.utils.context import set_context, get_context, reset_context
 from kavor.utils.logger import logger
-from kavor.utils.mm_plan import plan_shards
 from kavor.models import AutoModelForCausalLM
 
 
@@ -38,7 +39,10 @@ class ModelRunner:
         Sequence.block_size = config.kvcache_block_size
         self.model = AutoModelForCausalLM.from_pretrained(hf_config, use_tqdm=self.enable_log)
         self.sampler = Sampler()
+        self.mm_cache = None
         self.allocate_kv_cache()
+        self.mm_assembler = MMInputAssembler(
+            self.model, config, self.mm_cache, self.rank, self.world_size, self.enable_log)
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -95,7 +99,7 @@ class ModelRunner:
                 f"要发给 TP worker 的数据有 {n / 2**20:.1f} MB,超过共享内存 "
                 f"{len(self.shm.buf) / 2**20:.0f} MB:args 里不要夹带大张量"
                 "(多模态的像素张量应该在 MMInputs.for_workers 里就被丢掉,"
-                "改走 _scatter_mm 那条 NCCL 数据面)")
+                "改走 mm_inputs 里 scatter_pixels_to_ranks 那条 NCCL 数据面)")
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
@@ -230,8 +234,11 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        mm_kwargs = self.prepare_mm_inputs(seqs) if is_prefill else {}
-        logits = self.run_model(input_ids, positions, is_prefill, mm_kwargs)
+        try:
+            mm_kwargs = self.mm_assembler.prepare(seqs) if is_prefill else {}
+            logits = self.run_model(input_ids, positions, is_prefill, mm_kwargs)
+        finally:
+            self.mm_assembler.release_pins()
         self.cache.record_linear_states(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
@@ -295,6 +302,21 @@ class ModelRunner:
         决定前向峰值(峰值里最大的一项是 batch 维度的线性注意力状态),所以先做一次乐观
         估计拿到 profiling 用的 batch,再实测、再正式规划。
         """
+        # mm 池必须先于 KV 池分配:下面的 _probe_num_blocks 靠 mem_get_info 反推
+        # 可用预算,活着的 mm 池会自动从 KV 预算里扣掉
+        self.mm_cache = MMCache.from_config(self.config)
+        if self.mm_cache is not None and not hasattr(self.model, "get_mm_embeddings"):
+            if self.enable_log:
+                logger.warning("模型没有实现 get_mm_embeddings,mm cache 不生效")
+            self.mm_cache = None
+        if self.enable_log:
+            if self.mm_cache is not None:
+                self.mm_cache.log_summary()
+            elif self.config.enable_mm_cache:
+                reason = ("模型没有视觉塔" if self.config.vision_config is None
+                          else "--mm-cache-size-gb 不大于 0")
+                logger.warning("enable_mm_cache 已开启但%s,mm cache 不生效", reason)
+
         self.cache = CachePool(self.model, self.config, self.world_size)
 
         # 1) 乐观规划(不留激活余量):真实容量不会超过它,用它决定 profiling 的 batch 上界
@@ -411,84 +433,3 @@ class ModelRunner:
         if seq.is_multimodal:
             return self.model.mm_position_ids(seq)[:, start:end] 
         return torch.arange(start, end).unsqueeze(0).expand(3, -1)
-
-    def prepare_mm_inputs(self, seqs: list[Sequence]) -> dict:
-        mm_seqs = [seq for seq in seqs if seq.is_multimodal]
-        if not mm_seqs:
-            return {}
-        kwargs = {}
-        for pixel_key, grid_key, pad_key, ranges_key, name in (
-            ("pixel_values", "image_grid_thw", "image_pad_ranges", "image_visible_ranges", "图片"),
-            ("pixel_values_videos", "video_grid_thw", "video_pad_ranges", "video_visible_ranges", "视频"),
-        ):
-            grids = [getattr(seq.mm_inputs, grid_key) for seq in mm_seqs
-                     if getattr(seq.mm_inputs, grid_key) is not None]
-            if not grids:
-                continue
-            pixels = [getattr(seq.mm_inputs, pixel_key) for seq in mm_seqs
-                      if getattr(seq.mm_inputs, pixel_key) is not None]
-            kwargs[grid_key] = torch.cat(grids, dim=0).cuda(non_blocking=True)
-            kwargs[pixel_key] = self._scatter_mm(pixels, kwargs[grid_key])
-            kwargs[ranges_key] = self._visible_ranges(
-                mm_seqs, kwargs[grid_key], pad_key, grid_key, name)
-        return kwargs
-
-    def _visible_ranges(self, seqs: list[Sequence], grid: torch.Tensor,
-                        pad_key: str, grid_key: str,
-                        name: str) -> list[tuple[int, int]] | None:
-        merge_unit = self.config.vision_config.spatial_merge_size ** 2
-        ranges, lengths = [], []
-        for seq in seqs:
-            inputs = seq.mm_inputs
-            if getattr(inputs, grid_key) is None:
-                continue
-            rows = (getattr(inputs, grid_key).prod(-1) // merge_unit).tolist()
-            pads = getattr(inputs, pad_key)
-            assert pads is not None, (
-                f"多模态输入缺少 {pad_key}:只有 ModelInputs.build_inputs 会填它,"
-                "手工构造 MMInputs 时不能直接带像素张量")
-            assert len(pads) == len(rows), (
-                f"{pad_key} 有 {len(pads)} 段,{grid_key} 推出 {len(rows)} 行,对不上")
-            start = seq.num_cached_tokens
-            end = start + seq.num_scheduled_tokens
-            for (pad_start, pad_len), row in zip(pads, rows):
-                assert pad_len == row, (
-                    f"{name}占位符个数 {pad_len} 和 grid 推出的特征行数 {row} 对不上:"
-                    "processor 出的 input_ids 和 grid 不是同一份输入")
-                begin = min(max(start - pad_start, 0), pad_len)
-                finish = min(max(end - pad_start, 0), pad_len)
-                ranges.append((begin, max(finish - begin, 0)))
-                lengths.append(pad_len)
-        assert len(ranges) == grid.shape[0], (
-            f"算出 {len(ranges)} 段{name},和 grid 的 {grid.shape[0]} 行对不上")
-        if all(count == length for (_, count), length in zip(ranges, lengths)):
-            return None
-        return ranges
-
-    def _scatter_mm(self, pixels: list[torch.Tensor], grid: torch.Tensor) -> torch.Tensor:
-        world = self.world_size
-        rows = grid.prod(-1).tolist()
-        counts = [shard.row_end - shard.row_start for shard in plan_shards(rows, world)]
-        vision_config = self.config.vision_config
-        patch_dim = (vision_config.in_channels * vision_config.temporal_patch_size
-                     * vision_config.patch_size ** 2)
-        dtype = self.model.mm_pixel_dtype
-
-        if world == 1:
-            assert pixels, "有 grid 却没有像素张量"
-            return torch.cat(pixels, dim=0).to(device="cuda", dtype=dtype)
-
-        device = torch.device("cuda", self.rank)
-        if self.rank == 0:
-            assert pixels, "rank0 上有 grid 却没有像素张量"
-            # 按视觉塔的 dtype 传:塔里第一件事就是这个转换,提前做结果逐位相同、字节减半
-            src = torch.cat(pixels, dim=0).to(device=device, dtype=dtype)
-        else:
-            src = torch.empty(0, patch_dim, dtype=dtype, device=device)
-        mine = torch.empty(counts[self.rank], patch_dim, dtype=dtype, device=device)
-        dist.all_to_all_single(
-            mine, src,
-            output_split_sizes=[counts[self.rank] if i == 0 else 0 for i in range(world)],
-            input_split_sizes=counts if self.rank == 0 else [0] * world,
-        )
-        return mine

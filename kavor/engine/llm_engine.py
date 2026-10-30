@@ -14,7 +14,7 @@ from kavor.engine.sequence import Sequence
 from kavor.engine.scheduler import Scheduler
 from kavor.engine.model_runner import ModelRunner
 from kavor.utils.logger import setup_logging
-from .multimodal import ModelInputs
+from .multimodal import PromptInputs
 
 logger = logging.getLogger(__name__)
 
@@ -97,17 +97,18 @@ class LLMEngine:
 
     def build_inputs(self, messages: list[dict], max_pixels: int | None = None,
                      processor_kwargs: dict | None = None,
-                     **template_kwargs) -> ModelInputs:
+                     **template_kwargs) -> PromptInputs:
         assert self.processor is not None, (
             f"{self.config.model} 没有 processor(AutoProcessor),不支持多模态输入")
-        return ModelInputs.build_inputs(
+        return PromptInputs.build_inputs(
             self.tokenizer, self.processor, messages, max_pixels=max_pixels,
             processor_kwargs=processor_kwargs, **template_kwargs)
 
     def add_request(
         self,
-        inputs: ModelInputs,
-        sampling_params: SamplingParams
+        inputs: PromptInputs,
+        sampling_params: SamplingParams,
+        request_id: str | None = None,
     ) -> int:
         if len(inputs.token_ids) > self.config.max_num_batched_tokens:
             raise ValueError(
@@ -115,47 +116,88 @@ class LLMEngine:
                 f"({self.config.max_num_batched_tokens}):多模态序列的 prefill 不切分,排不下就会一直等。"
                 "调大 --max-num-batched-tokens,或用更小的图/更少的帧")
         seq = Sequence(inputs, sampling_params)
+        seq.request_id = request_id
         self.scheduler.add(seq)
         return seq.seq_id
 
     def step(self):
         scheduled_seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in scheduled_seqs) if is_prefill else -len(scheduled_seqs)
         token_ids = self.model_runner.call("run", scheduled_seqs, is_prefill)
         if is_prefill:
             for seq in scheduled_seqs:
-                seq.first_token_time = perf_counter()
+                seq.stats.first_token_time = perf_counter()
         self.scheduler.postprocess(scheduled_seqs, token_ids, is_prefill)
         for seq in scheduled_seqs:
             if seq.is_finished:
-                seq.finish_time = perf_counter()
-        outputs = [(seq.seq_id, seq.completion_token_ids, seq.first_token_time, seq.finish_time) for seq in scheduled_seqs if seq.is_finished]
-        
-        return outputs, num_tokens
+                self.log_request_stats(seq, perf_counter())
+        outputs = [(seq.seq_id, seq.completion_token_ids)
+                   for seq in scheduled_seqs if seq.is_finished]
+
+        return outputs
+
+    def log_request_stats(self, seq: Sequence, finish: float):
+        stats = seq.stats
+        prompt = seq.num_prompt_tokens
+        completion = seq.num_completion_tokens
+        first = stats.first_token_time
+
+        label = f"seq {seq.seq_id}"
+        if seq.request_id:
+            label += f" ({seq.request_id})"
+        parts = [f"{label} finished", f"prompt length: {prompt} tokens"]
+        prefix_hit = stats.prefix_cache_hit_tokens
+        if prefix_hit is not None:
+            parts.append(
+                f"prefix cache hit rate: {prefix_hit}/{prompt}"
+                f" ({100.0 * prefix_hit / prompt:.1f}%)")
+        parts.append(f"output length: {completion} tokens")
+        if stats.mm_total_items:
+            parts.append(
+                f"mm cache hit items: {stats.mm_hit_items}/{stats.mm_total_items}")
+            parts.append(
+                f"mm cache hit rate:"
+                f" {100.0 * stats.mm_hit_items / stats.mm_total_items:.1f}%")
+
+        decode_tokens = completion - 1
+        decode_time = finish - first if first is not None else 0.0
+        if first is not None:
+            parts.append(f"TTFT: {first - stats.arrival_time:.2f}s")
+        if decode_tokens > 0 and decode_time > 0:
+            parts.append(f"TPOT: {1000.0 * decode_time / decode_tokens:.1f}ms")
+        if first is not None and stats.prefill_start_time is not None:
+            prefill = first - stats.prefill_start_time
+            if prefill > 0:
+                computed = prompt - (prefix_hit or 0)
+                parts.append(f"prefill throughput: {computed / prefill:.0f} tok/s")
+        if decode_tokens > 0 and decode_time > 0:
+            parts.append(f"decode throughput: {decode_tokens / decode_time:.0f} tok/s")
+        parts.append(f"elapsed: {finish - stats.arrival_time:.2f}s")
+
+        logger.info("%s", ", ".join(parts))
 
     def is_finished(self):
         return self.scheduler.is_finished()
     
     def normalize_inputs(
         self, 
-        inputs: list[str] | list[list[int]] | list[ModelInputs]
-    ) -> list[ModelInputs]:
+        inputs: list[str] | list[list[int]] | list[PromptInputs]
+    ) -> list[PromptInputs]:
         normalized = []
         for item in inputs:
-            if isinstance(item, ModelInputs):
+            if isinstance(item, PromptInputs):
                 normalized.append(item)
             elif isinstance(item, str):
                 token_ids = self.tokenizer.encode(item)
-                normalized.append(ModelInputs(token_ids, item))
+                normalized.append(PromptInputs(token_ids, item))
             elif isinstance(item, int):
-                normalized.append(ModelInputs(torch.tensor(item), None))
+                normalized.append(PromptInputs(torch.tensor(item), None))
             else:
                 raise RuntimeError("Not supported data type!")
         return normalized
 
     def generate(
         self,
-        inputs: list[str] | list[list[int]] | list[ModelInputs],
+        inputs: list[str] | list[list[int]] | list[PromptInputs],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
@@ -167,23 +209,10 @@ class LLMEngine:
             self.add_request(item, sp)
         
         outputs = {}
-        
-        prefill_throughput = 0.
-        decode_throughput = 0.
-        
+
         pbar = tqdm(total=len(inputs), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
-            pbar.set_postfix({
-                "Prefill": f"{int(prefill_throughput)}tok/s",
-                "Decode": f"{int(decode_throughput)}tok/s",
-            })
-            for seq_id, token_ids, _, _ in output:
+            for seq_id, token_ids in self.step():
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()

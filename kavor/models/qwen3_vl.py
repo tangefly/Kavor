@@ -588,6 +588,17 @@ class Qwen3VLModel(nn.Module):
     ) -> list[torch.Tensor]:
         return self.get_image_features(pixel_values_videos, video_grid_thw)
 
+    def get_mm_embeddings(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, modality: str = "image"
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """引擎侧缓存接口:只跑视觉塔,返回 (merged 特征, deepstack 特征列表)。
+
+        图像和视频走同一条塔,`modality` 只为和 Qwen3_5 保持同签名;
+        TP 分片与 broadcast 留在模型内部,调用方不需要知道 plan_shards。
+        """
+        del modality
+        return self._vision_features_parallel(pixel_values, grid_thw)
+
     def _vision_features_parallel(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -658,17 +669,23 @@ class Qwen3VLModel(nn.Module):
         video_grid_thw: torch.LongTensor | None = None,
         image_visible_ranges: list[tuple[int, int]] | None = None,
         video_visible_ranges: list[tuple[int, int]] | None = None,
+        image_embeds: torch.Tensor | None = None,
+        deepstack_image_embeds: list[torch.Tensor] | None = None,
+        video_embeds: torch.Tensor | None = None,
+        deepstack_video_embeds: list[torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
             inputs_embeds = self.language_model.embed_tokens(input_ids)
-        if (pixel_values is not None or pixel_values_videos is not None) and input_ids is None:
+        has_media = (pixel_values is not None or pixel_values_videos is not None
+                     or image_embeds is not None or video_embeds is not None)
+        if has_media and input_ids is None:
             raise ValueError("多模态输入需要 input_ids:占位符位置是从 token id 里找的")
 
         if position_ids is None:
-            if pixel_values is not None or pixel_values_videos is not None:
+            if has_media:
                 raise ValueError(
                     "多模态输入的 3D position_ids 需要由外部传入:"
                     "引擎里由 get_rope_index/mm_position_ids 预计算")
@@ -676,10 +693,15 @@ class Qwen3VLModel(nn.Module):
 
         image_mask = None
         video_mask = None
-        deepstack_image_embeds = None
-        deepstack_video_embeds = None
 
-        if pixel_values is not None:
+        if image_embeds is not None:
+            # 引擎侧 mm cache 命中/未命中拼好的特征,视觉塔已经跑过了
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, deepstack_image_embeds = self._place_vision_tokens(
+                input_ids, inputs_embeds, image_embeds, deepstack_image_embeds, "image")
+            if image_mask is not None:
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        elif pixel_values is not None:
             if image_grid_thw is None:
                 raise ValueError("传了 pixel_values 就要同时传 image_grid_thw")
             # 本步一个图片占位符都没有(整张图都在 prefix cache 里):视觉塔不用跑
@@ -694,7 +716,13 @@ class Qwen3VLModel(nn.Module):
                 if image_mask is not None:
                     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-        if pixel_values_videos is not None:
+        if video_embeds is not None:
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            video_mask, deepstack_video_embeds = self._place_vision_tokens(
+                input_ids, inputs_embeds, video_embeds, deepstack_video_embeds, "video")
+            if video_mask is not None:
+                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        elif pixel_values_videos is not None:
             if video_grid_thw is None:
                 raise ValueError("传了 pixel_values_videos 就要同时传 video_grid_thw")
             if (input_ids == self.config.video_token_id).any():
@@ -781,6 +809,11 @@ class Qwen3VLForCausalLM(nn.Module):
         """引擎按这个 dtype 把像素张量发给各 rank,省一次无用的大张量转换。"""
         return self.model.visual.patch_embed.proj.weight.dtype
 
+    def get_mm_embeddings(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor,
+                          modality: str = "image") -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """给 ModelRunner 的 mm cache 用:只算视觉塔,不做占位符填充。"""
+        return self.model.get_mm_embeddings(pixel_values, grid_thw, modality)
+
     def mm_position_ids(self, seq) -> torch.LongTensor:
         """为一条多模态序列预计算 3D M-RoPE 位置,并把 rope_delta 回填到输入上。"""
         inputs = seq.mm_inputs
@@ -789,8 +822,10 @@ class Qwen3VLForCausalLM(nn.Module):
             "M-RoPE 才能算对")
         input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long)
         mm_token_type_ids = torch.tensor([inputs.mm_token_type_ids], dtype=torch.long)
-        image_grid_thw = None if inputs.image_grid_thw is None else inputs.image_grid_thw.cpu()
-        video_grid_thw = None if inputs.video_grid_thw is None else inputs.video_grid_thw.cpu().clone()
+        image_grid_thw = (None if inputs.image is None or inputs.image.grid_thw is None
+                          else inputs.image.grid_thw.cpu())
+        video_grid_thw = (None if inputs.video is None or inputs.video.grid_thw is None
+                          else inputs.video.grid_thw.cpu().clone())
         positions, deltas = self.model.get_rope_index(
             input_ids,
             mm_token_type_ids,

@@ -13,7 +13,7 @@ from kavor.engine.async_engine import AsyncEngine
 from kavor.interface.cli import add_server_args
 from kavor.sampling_params import SamplingParams
 from kavor.interface.parser.factory import *
-from kavor.engine.multimodal import ModelInputs
+from kavor.engine.multimodal import PromptInputs
 
 from .request import *
 from .response import *
@@ -174,7 +174,7 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
             **(req.chat_template_kwargs or {}),
         }
         
-        prompt = ModelInputs.build_inputs(
+        inputs = PromptInputs.build_inputs(
             app.state.engine.tokenizer,
             app.state.engine.processor,
             messages,
@@ -182,10 +182,10 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
             tools=req.tools,
             **template_kwargs,
         )
-        parsed_prompt = prompt.prompt
+        parsed_prompt = inputs.prompt
 
         queue = await app.state.engine.add_request(
-            request_id, prompt, to_sampling_params(req, app.state.args))
+            request_id, inputs, to_sampling_params(req, app.state.args))
 
         token_ids, finish_reason = await consume_all(queue)
         parsed = app.state.paser.parse(
@@ -225,6 +225,8 @@ def run(args: argparse.Namespace):
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        enable_mm_cache=args.enable_mm_cache,
+        mm_cache_size_gb=args.mm_cache_size_gb,
         enforce_eager=args.enforce_eager,
         trust_remote_code=args.trust_remote_code,
     )

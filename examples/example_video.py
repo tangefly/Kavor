@@ -17,7 +17,7 @@ import os
 from transformers.video_utils import VideoMetadata
 
 from kavor import LLM, SamplingParams
-from kavor.engine.multimodal import probe_video, video_frames_from_path
+from kavor.engine.media_io import probe_video, video_frames_from_path
 
 EXAMPLE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(EXAMPLE_DIR)
@@ -74,9 +74,9 @@ def main():
             messages, max_pixels=args.max_pixels, processor_kwargs=processor_kwargs))
 
     first = inputs[0]
-    video_tokens = sum(n for _, n in (first.mm_inputs.video_pad_ranges or []))
+    video_tokens = sum(n for _, n in (first.mm_inputs.video.placeholder_runs or []))
     print(f"prompt {len(first.token_ids)} token,其中视频占位符 {video_tokens} 个,"
-          f"视频 grid(按时域 patch 拆开){first.mm_inputs.video_grid_thw.tolist()}")
+          f"视频 grid(按时域 patch 拆开){first.mm_inputs.video.grid_thw.tolist()}")
 
     # 一问一答地提交:同一批 prefill 的请求互相看不到对方的 KV,只有前一问跑完、
     # 块哈希已经写进 prefix cache 之后,后一问才可能整段命中视频前缀。
