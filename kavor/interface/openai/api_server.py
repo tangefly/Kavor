@@ -14,6 +14,7 @@ from kavor.interface.cli import add_server_args
 from kavor.sampling_params import SamplingParams
 from kavor.interface.parser.factory import *
 from kavor.engine.multimodal import PromptInputs
+from kavor.utils.banner import print_banner, runtime_info
 
 from .request import *
 from .response import *
@@ -217,7 +218,23 @@ def build_app(args: argparse.Namespace, engine: AsyncEngine) -> FastAPI:
 
     return app
 
+def banner_info(args: argparse.Namespace) -> dict[str, str]:
+    """横幅里展示的启动信息:模型、运行环境、并行配置、监听地址。"""
+    info = {"model": args.model}
+    served = getattr(args, "served_model_name", None)
+    if served and served != args.model:
+        info["served"] = served
+    info["runtime"] = " · ".join(f"{k} {v}" for k, v in runtime_info().items())
+    info["engine"] = (
+        f"TP={args.tensor_parallel_size} · max_model_len={args.max_model_len}"
+        f" · eager={'on' if args.enforce_eager else 'off'}")
+    info["api"] = f"http://{args.host}:{args.port}"
+    return info
+
+
 def run(args: argparse.Namespace):
+    # 先亮 logo 再加载模型:权重加载可能要几十秒,横幅能立刻说明进程已经起来了
+    print_banner(banner_info(args))
     engine = AsyncEngine(
         args.model,
         model_name=args.served_model_name,
