@@ -255,12 +255,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         local = self.num_v_heads
         param.data.copy_(loaded_weight.narrow(0, self.tp_rank * local, local))
 
-    def _slot_ids(self) -> torch.Tensor:
-        slot_ids = get_context().linear_slot_ids
-        assert slot_ids is not None, (
-            "线性注意力层需要序列的状态块 id(linear_slot_ids),但 context 里没有:"
-            "序列进模型之前要先经过调度器的块分配")
-        return slot_ids[:, self.state_group]
+    def get_linear_slot_ids(self):
+        ids = get_context().linear_slot_ids
+        assert ids is not None, "..."
+        return ids[:, self.state_group]
+
+    def get_linear_cache_slot_ids(self):
+        ctx = get_context()
+        if ctx.linear_cache_slot_ids is None or ctx.states_store_flags is None:
+            return None, None          # warmup / profile
+        return (ctx.linear_cache_slot_ids[:, self.state_group].tolist(),
+                ctx.states_store_flags.tolist())
 
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         if get_context().is_prefill:
@@ -308,7 +313,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_context()
-        slot_ids = self._slot_ids().tolist()
+        slot_ids = self.get_linear_slot_ids().tolist()
+        cache_slot_ids, store_flags = self.get_linear_cache_slot_ids()
         cu_seqlens_q = context.cu_seqlens_q.tolist()
         cu_seqlens_k = context.cu_seqlens_k.tolist()
         kernel_size = self.conv_kernel_size - 1
@@ -316,25 +322,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         for i, slot in enumerate(slot_ids):
             q_start, q_end = cu_seqlens_q[i], cu_seqlens_q[i + 1]
             seq_len = q_end - q_start
-            start = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]) - seq_len
-            assert start == 0, (
-                f"第 {i} 条序列从第 {start} 个 token 开始,说明它复用了 KV cache(prefix cache 命中)"
-                "或被切块调度,这两种情况下线性注意力的状态无法恢复。"
-                "线性模型的 prefix cache 已在 BlockManager 里关掉;如果仍然触发,检查 max_num_batched_tokens "
-                "是否小于 prompt 长度(切块 prefill 目前不支持线性层)。"
-            )
+            # 本段 query 之前已缓存的 token 数:prefix cache 命中(bundle)或切块续算。
+            # 这些 token 的线性状态不在本段 hidden_states 里,从 slot 的状态块恢复。
+            num_cached = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]) - seq_len
 
             x = hidden_states[q_start:q_end].unsqueeze(0)                    # [1, T, hidden]
             mixed_qkv = self.in_proj_qkv(x).transpose(1, 2)                  # [1, conv_dim, T],卷积前的值
-            conv_state = mixed_qkv[:, :, -kernel_size:]
-            if conv_state.shape[-1] < kernel_size:
-                conv_state = F.pad(conv_state, (kernel_size - conv_state.shape[-1], 0))
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                self.conv1d.weight.squeeze(1),
-                self.conv1d.bias,
-                activation=self.activation,
-            ).transpose(1, 2)
+            if num_cached > 0:
+                # 前缀卷积状态拼在本段输入前面,无 padding 卷积后输出长度正好是 T
+                conv_inputs = torch.cat([self.conv_pool[slot].unsqueeze(0), mixed_qkv], dim=-1)
+                conv_state = conv_inputs[:, :, -kernel_size:]
+                mixed_qkv = F.conv1d(
+                    conv_inputs, self.conv1d.weight, self.conv1d.bias, groups=self.conv_dim
+                )
+                if self.activation is not None:
+                    mixed_qkv = ACT2FN[self.activation](mixed_qkv)
+                mixed_qkv = mixed_qkv.transpose(1, 2)
+                initial_state = self.recurrent_pool[slot].unsqueeze(0)       # [1, H, K, V]
+            else:
+                conv_state = mixed_qkv[:, :, -kernel_size:]
+                if conv_state.shape[-1] < kernel_size:
+                    conv_state = F.pad(conv_state, (kernel_size - conv_state.shape[-1], 0))
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                    activation=self.activation,
+                ).transpose(1, 2)
+                initial_state = None
 
             query, key_states, value = self._split_qkv(mixed_qkv)
             z = self.in_proj_z(x).reshape(1, seq_len, -1, self.head_v_dim)
@@ -346,18 +361,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 value,
                 g=g,
                 beta=beta,
-                initial_state=None,
+                initial_state=initial_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
             self.conv_pool[slot] = conv_state[0]
             self.recurrent_pool[slot] = last_recurrent_state[0]
+            if store_flags is not None and store_flags[i]:
+                cache_slot = cache_slot_ids[i]
+                self.conv_pool[cache_slot] = conv_state[0]
+                self.recurrent_pool[cache_slot] = last_recurrent_state[0]
             outputs.append(self._finalize(core_attn_out, z, 1, seq_len)[0])
 
         return torch.cat(outputs, dim=0)
 
     def decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        slot_ids = self._slot_ids()                                          # [B] 本组的状态块 id
+        slot_ids = self.get_linear_slot_ids()                                          # [B] 本组的状态块 id
         conv_states = self.conv_pool[slot_ids]                               # [B, conv_dim, k-1]
         mixed_qkv = self.in_proj_qkv(hidden_states).unsqueeze(1).transpose(1, 2)    # [B, conv_dim, 1]
         mixed_qkv = causal_conv1d_update(

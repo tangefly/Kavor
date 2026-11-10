@@ -210,7 +210,13 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, mm_kwargs: dict | None = None):
+    def run_model(
+        self, 
+        input_ids: torch.Tensor, 
+        positions: torch.Tensor, 
+        is_prefill: bool, 
+        mm_kwargs: dict | None = None,
+    ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs[-1]:
             logits = self.model(input_ids, positions, **(mm_kwargs or {}))
             return self.model.compute_logits(logits)
@@ -361,6 +367,7 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         has_mm = any(seq.is_multimodal for seq in seqs)
+        states_store_flags = []
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
@@ -388,6 +395,7 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
+            states_store_flags.append(seq.store_linear_states)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -398,8 +406,10 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        states_store_flags = torch.tensor(states_store_flags, dtype=torch.bool, pin_memory=True).cuda(non_blocking=True)
         linear_slot_ids = self.cache.prepare_linear_slot_ids(seqs)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, linear_slot_ids)
+        linear_cache_slot_ids = self.cache.prepare_linear_cache_slot_ids(seqs)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, linear_slot_ids, linear_cache_slot_ids, states_store_flags)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):

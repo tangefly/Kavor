@@ -170,6 +170,31 @@ class CachePool:
                 "block groups sharing a page would overwrite each other")
             rows.append(ids)
         return torch.tensor(rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+    
+    def prepare_linear_cache_slot_ids(self, seqs: list[Sequence]) -> torch.Tensor | None:
+        if self.linear_padding_slot is None:
+            return None
+        rows = []
+        for seq in seqs:
+            ids = seq.state_cache_ids
+            if ids is None:
+                # Warmup builds fake sequences without the scheduler, so point them at the padding block
+                assert not seq.block_table, (
+                    f"Sequence {seq.seq_id} is about to run without state blocks: "
+                    "they are allocated during prefill scheduling")
+                rows.append([self.linear_padding_slot] * self.num_state_groups)
+                continue
+            assert len(ids) == self.num_state_groups, (
+                f"Sequence {seq.seq_id} has {len(ids)} state blocks, "
+                f"but the model needs {self.num_state_groups}")
+            assert all(0 <= i < self.linear_padding_slot for i in ids), (
+                f"State block ids out of range ({ids}): valid range is [0, {self.linear_padding_slot}); "
+                "the last block is reserved for CUDA graphs")
+            assert len(set(ids)) == len(ids), (
+                f"Duplicate state blocks in one sequence ({ids}): "
+                "block groups sharing a page would overwrite each other")
+            rows.append(ids)
+        return torch.tensor(rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
 
     def check_linear_states(self, seqs: list[Sequence]):
         """Self-check before decode: each sequence's state blocks should stop exactly at len(seq) - 1 tokens.

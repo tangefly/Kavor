@@ -75,8 +75,10 @@ class Sequence:
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
-        self.block_table = []
+        self.block_table = []   # 逻辑块到物理块的映射，逻辑号 i，物理号 self.block_table[i]
         self.state_block_ids: list[int] | None = None
+        self.state_cache_ids: list[int] | None = None
+        self.store_linear_states = False
         
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
