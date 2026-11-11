@@ -146,10 +146,12 @@ class Sequence:
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         mm_inputs = None if self.mm_inputs is None else self.mm_inputs.for_workers(prefill=self.is_prefill)
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm_inputs, self.state_block_ids)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm_inputs, self.state_block_ids, self.state_cache_ids, self.pending_tail_copy, self.store_linear_states, self.temperature)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm_inputs, self.state_block_ids = state
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
+         self.block_table, last_state, mm_inputs, self.state_block_ids, self.state_cache_ids, 
+         self.pending_tail_copy, self.store_linear_states, self.temperature) = state
         self.mm_inputs = mm_inputs
         self.stats = None       # 统计只在引擎侧收集,worker 副本不需要
         if isinstance(last_state, list):
