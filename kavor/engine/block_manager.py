@@ -108,7 +108,7 @@ class BlockManager:
                     # linear states priorty first
                     break
                 token_ids = seq.block(i)
-                prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.mm_hash_id)
+                prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.block_media_hashes(i))
                 block_id = self.hash_to_block_id.get(prefix_hash_id, -1)
                 if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                     break
@@ -149,7 +149,7 @@ class BlockManager:
         # KV Cache block reuse
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
-            prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.mm_hash_id)
+            prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.block_media_hashes(i))
             block_id = self.hash_to_block_id[prefix_hash_id]
             block = self.blocks[block_id]
             if block_id in self.used_block_ids:
@@ -236,7 +236,7 @@ class BlockManager:
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
-            prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.mm_hash_id)
+            prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.block_media_hashes(i))
             block.update(prefix_hash_id, token_ids)
             self.hash_to_block_id[prefix_hash_id] = block.block_id
 

@@ -127,10 +127,12 @@ class Sequence:
             return True
         return bool(inputs.mm_token_type_ids) and any(inputs.mm_token_type_ids)
 
-    @property
-    def mm_hash_id(self) -> bytes | int:
-        """媒体摘要(prefix cache 的块哈希要用);纯文本序列没有 mm_inputs,用 -1。"""
-        return -1 if self.mm_inputs is None else self.mm_inputs.mm_hash_id
+    def block_media_hashes(self, i: int) -> tuple[bytes | None, ...] | None:
+        hashes = None if self.mm_inputs is None else self.mm_inputs.token_media_hashes
+        if hashes is None:
+            return None
+        media_hashes = tuple(hashes[i * self.block_size: (i + 1) * self.block_size])
+        return None if not any(media_hashes) else media_hashes
 
     def block(self, i):
         assert 0 <= i < self.num_blocks

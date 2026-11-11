@@ -56,14 +56,6 @@ def build_media_items(
     return items
 
 
-def request_media_hash(image_items: list[MediaItem], video_items: list[MediaItem]) -> bytes:
-    """请求级媒体摘要(prefix cache 的块哈希用),由 per-media id 依次拼出来。"""
-    digest = hashlib.sha256()
-    for item in image_items + video_items:
-        digest.update(item.hash_id)
-    return digest.digest()
-
-
 def placeholder_positions(placeholder_runs) -> list[int]:
     """把 [(start, len), ...] 展开成占位符在 prompt 里的位置列表(升序)。"""
     positions = []
@@ -73,7 +65,7 @@ def placeholder_positions(placeholder_runs) -> list[int]:
 
 
 @dataclass
-class ModalityInputs:
+class ModalityData:
     """一种模态的 processor 输出 + 引擎侧的位置/身份簿记。
 
     placeholder_runs 与 items 一一对应:第 i 段占位符属于第 i 个媒体项。
@@ -84,15 +76,30 @@ class ModalityInputs:
     placeholder_runs: list[tuple[int, int]] | None = None
     items: list[MediaItem] | None = None
 
-    def for_workers(self, prefill: bool) -> "ModalityInputs":
+    def for_workers(self, prefill: bool) -> "ModalityData":
         if not prefill:
-            return ModalityInputs()
-        # 像素只留在 rank0;TP worker 需要每媒体 id 才能做出同样的缓存决策
-        return ModalityInputs(
+            return ModalityData()
+        # 像素与媒体簿记只留在 rank0:块哈希在 scheduler 的 block_manager 里算,
+        # worker 不需要这些信息
+        return ModalityData(
             grid_thw=self.grid_thw,
             placeholder_runs=self.placeholder_runs,
             items=self.items,
         )
+
+
+def build_token_media_hashes(
+    num_tokens: int,
+    *modalities: ModalityData | None,
+) -> list[bytes | None]:
+    hashes: list[bytes | None] = [None] * num_tokens
+    for modality in modalities:
+        if modality is None:
+            continue
+        # placeholder_runs 与 items 一一对应:第 i 段占位符属于第 i 个媒体项
+        for (start, length), item in zip(modality.placeholder_runs, modality.items):
+            hashes[start:start + length] = [item.hash_id] * length
+    return hashes
 
 
 @dataclass
@@ -100,9 +107,9 @@ class MMInputs:
     """一条序列的多模态输入:每种模态的 processor 输出 + 引擎簿记,再加 M-RoPE 状态。"""
 
     mm_token_type_ids: list[int] | None = None
-    image: ModalityInputs | None = None
-    video: ModalityInputs | None = None
-    mm_hash_id: bytes | int = -1
+    image: ModalityData | None = None
+    video: ModalityData | None = None
+    token_media_hashes: list[bytes | None] | None = None
     rope_delta: int = 0
 
     def for_workers(self, prefill: bool) -> "MMInputs":
@@ -158,23 +165,26 @@ class PromptInputs:
                 video_items = build_media_items(
                     inputs.get("pixel_values_videos"), inputs.get("video_grid_thw"),
                     merge_unit, split_video=True)
+                image_inputs = ModalityData(
+                    pixel_values=inputs.get("pixel_values"),
+                    grid_thw=inputs.get("image_grid_thw"),
+                    placeholder_runs=find_placeholder_runs(
+                        token_ids, processor.image_token_id),
+                    items=image_items,
+                ) if image_items else None
+                video_inputs = ModalityData(
+                    pixel_values=inputs.get("pixel_values_videos"),
+                    grid_thw=split_video_grid(inputs.get("video_grid_thw")),
+                    placeholder_runs=find_placeholder_runs(
+                        token_ids, processor.video_token_id),
+                    items=video_items,
+                ) if video_items else None
                 mm_inputs = MMInputs(
                     mm_token_type_ids=inputs["mm_token_type_ids"][0].tolist(),
-                    image=ModalityInputs(
-                        pixel_values=inputs.get("pixel_values"),
-                        grid_thw=inputs.get("image_grid_thw"),
-                        placeholder_runs=find_placeholder_runs(
-                            token_ids, processor.image_token_id),
-                        items=image_items,
-                    ) if image_items else None,
-                    video=ModalityInputs(
-                        pixel_values=inputs.get("pixel_values_videos"),
-                        grid_thw=split_video_grid(inputs.get("video_grid_thw")),
-                        placeholder_runs=find_placeholder_runs(
-                            token_ids, processor.video_token_id),
-                        items=video_items,
-                    ) if video_items else None,
-                    mm_hash_id=request_media_hash(image_items, video_items),
+                    image=image_inputs,
+                    video=video_inputs,
+                    token_media_hashes=build_token_media_hashes(
+                        len(token_ids), image_inputs, video_inputs),
                 )
             return cls(token_ids=token_ids.tolist(), prompt=prompt, mm_inputs=mm_inputs)
         inputs = tokenizer(prompt, return_tensors="pt")

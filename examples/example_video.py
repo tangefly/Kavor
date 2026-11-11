@@ -57,9 +57,6 @@ def main():
     llm = LLM(args.model, enforce_eager=False, tensor_parallel_size=args.tp_size,
               max_num_seqs=args.max_num_seqs)
     sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
-
-    # 同一段视频 + 不同问题:视频那一段 token 完全一样,块哈希也带上像素摘要(mm_hash_id),
-    # 所以第二问开始视频前缀直接命中,不用再跑视觉塔、不用重算那两千多个 token 的 KV。
     processor_kwargs = {
         "videos_kwargs": {"fps": args.fps},
         "video_metadata": [VideoMetadata(fps=info["fps"], total_num_frames=len(frames))],

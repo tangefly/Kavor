@@ -7,7 +7,7 @@ import torch.distributed as dist
 
 from kavor.config import Config
 from kavor.engine.mm_cache import MMCache
-from kavor.engine.multimodal import MediaItem, ModalityInputs, placeholder_positions
+from kavor.engine.multimodal import MediaItem, ModalityData, placeholder_positions
 from kavor.engine.sequence import Sequence
 from kavor.utils.mm_plan import plan_shards
 
@@ -68,7 +68,7 @@ MM_MODALITIES = (
 
 def item_spans(
     seq: Sequence,
-    inputs: ModalityInputs,
+    inputs: ModalityData,
     spec: MMModality,
 ) -> list[tuple[MediaItem, int, int]]:
     """每个媒体在本步 prefill 窗口里可见的行区间 [begin, begin+count)。
@@ -140,7 +140,7 @@ class MMInputAssembler:
         self.pins.clear()
 
     @staticmethod
-    def modality_inputs(seq: Sequence, spec: MMModality) -> ModalityInputs | None:
+    def modality_data(seq: Sequence, spec: MMModality) -> ModalityData | None:
         mm_inputs = seq.mm_inputs
         return None if mm_inputs is None else getattr(mm_inputs, spec.name)
 
@@ -179,7 +179,7 @@ class MMInputAssembler:
         rows: list[VisibleSlice] = []
         items: dict[bytes, tuple[Sequence, MediaItem]] = {}
         for seq in seqs:
-            inputs = self.modality_inputs(seq, spec)
+            inputs = self.modality_data(seq, spec)
             if inputs is None or not inputs.items:
                 continue
             for item, begin, count in item_spans(seq, inputs, spec):
@@ -214,7 +214,7 @@ class MMInputAssembler:
         # Step 2: gather full rows for each miss; pixels live on rank0 only.
         grids, pixels = [], []
         for _, seq, item in pending:
-            inputs = self.modality_inputs(seq, spec)
+            inputs = self.modality_data(seq, spec)
             grids.append(inputs.grid_thw[item.grid_start:item.grid_start + item.grid_rows])
             if inputs.pixel_values is not None:
                 pixels.append(
@@ -265,9 +265,9 @@ class MMInputAssembler:
     def prepare_pixel_inputs(self, seqs: list[Sequence]) -> dict:
         kwargs = {}
         for spec in MM_MODALITIES:
-            inputs_list: list[ModalityInputs] = []
+            inputs_list: list[ModalityData] = []
             for seq in seqs:
-                inputs = self.modality_inputs(seq, spec)
+                inputs = self.modality_data(seq, spec)
                 if inputs is not None and inputs.grid_thw is not None:
                     inputs_list.append(inputs)
             if not inputs_list:
@@ -290,7 +290,7 @@ class MMInputAssembler:
         merge_unit = self.config.vision_config.spatial_merge_size ** 2
         ranges, lengths = [], []
         for seq in seqs:
-            inputs = self.modality_inputs(seq, spec)
+            inputs = self.modality_data(seq, spec)
             if inputs is None or inputs.grid_thw is None:
                 continue
             rows = (inputs.grid_thw.prod(-1) // merge_unit).tolist()
