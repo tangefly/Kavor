@@ -139,6 +139,15 @@ class CachePool:
         """Padding row for CUDA graphs (the last row of the pool); None without linear layers."""
         return self.num_blocks - 1 if self.has_linear_attention else None
 
+    def copy_blocks(self, src_ids: list[int], dst_ids: list[int]):
+        """整页 D2D 拷贝(所有层池): bundle 命中时把尾块里的前缀 KV 拷给 adopter 的新块。
+
+        与 forward 同一 stream, 由调用方保证在本步 forward 之前发射。
+        """
+        if not src_ids:
+            return
+        self.pools[:, dst_ids] = self.pools[:, src_ids]
+
     # meta data
 
     def prepare_linear_slot_ids(self, seqs: list[Sequence]) -> torch.Tensor | None:

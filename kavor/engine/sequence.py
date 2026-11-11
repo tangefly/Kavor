@@ -78,6 +78,7 @@ class Sequence:
         self.block_table = []   # 逻辑块到物理块的映射，逻辑号 i，物理号 self.block_table[i]
         self.state_block_ids: list[int] | None = None
         self.state_cache_ids: list[int] | None = None
+        self.pending_tail_copy: tuple[int, int] | None = None   # bundle 命中时待拷贝的尾块 (src, dst)
         self.store_linear_states = False
         
         self.temperature = sampling_params.temperature

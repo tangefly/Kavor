@@ -187,6 +187,7 @@ class Scheduler:
         elif snap_end_token_id not in seq.token_ids[seq.num_cached_tokens + 1:]:
             return min(num_tokens, remaining)
         else:
-            seq.store_linear_states = True
             snap_end_token_pos = seq.token_ids.index(snap_end_token_id)
-            return min(snap_end_token_pos - seq.num_cached_tokens, num_tokens, remaining)
+            scheduled = min(snap_end_token_pos - seq.num_cached_tokens, num_tokens, remaining)
+            seq.store_linear_states = scheduled == snap_end_token_pos - seq.num_cached_tokens
+            return scheduled

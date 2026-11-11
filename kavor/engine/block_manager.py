@@ -12,6 +12,7 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
+        self.bundle = None
 
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
@@ -21,16 +22,19 @@ class Block:
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
+        self.bundle = None
 
 class Bundle:
     def __init__(
         self,
+        parent_hash,
         partial_token_ids,
-        state_block_ids,
+        state_cache_ids,
         tail_block_id
     ):
+        self.parent_hash = parent_hash
         self.partial_token_ids = partial_token_ids
-        self.state_block_ids = state_block_ids
+        self.state_cache_ids = state_cache_ids
         self.tail_block_id = tail_block_id
 
 class BlockManager:
@@ -45,7 +49,7 @@ class BlockManager:
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        self.linear_hash_table: dict[int, Bundle] = dict()
+        self.linear_hash_table: dict[int, list[Bundle]] = dict()
         self.has_linear_attention = has_linear_attention
         self.num_state_groups = num_state_groups if has_linear_attention else 0
         # self.enable_prefix_cache = not has_linear_attention
@@ -75,6 +79,12 @@ class BlockManager:
         assert block.ref_count == 0
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
+        # 惰性逐出: bundle 可能已被 adopt 或被同组其他块逐出, 不在表里就跳过
+        bundle = block.bundle
+        if bundle is not None:
+            bundles = self.linear_hash_table.get(bundle.parent_hash)
+            if bundles and bundle in bundles:
+                bundles.remove(bundle)
         block.reset()
         self.used_block_ids.add(block_id)
         return block_id
@@ -105,9 +115,11 @@ class BlockManager:
                 num_cached_blocks += 1
                 if block_id in self.used_block_ids:
                     num_needed_blocks -= 1
-            bundle = self.search_linear_states(prefix_hash_id, seq, num_cached_blocks)
             if bundle == None:
-                # KV Block 遍历完还是没有对应的 states 缓存，需要重新计算 states
+                bundle = self.search_linear_states(prefix_hash_id, seq, num_cached_blocks)
+            if bundle is not None and num_cached_blocks * self.block_size + len(bundle.partial_token_ids) >= seq.num_tokens:
+                bundle = None
+            if bundle == None:
                 num_cached_blocks = 0
                 num_needed_blocks = seq.num_blocks
         # 需要 2 倍的 num_state_groups，一份保存快照，一份保存推理时变化的 states
@@ -120,6 +132,21 @@ class BlockManager:
     def allocate_prefill(self, seq: Sequence, num_cached_blocks: int, bundle: Bundle):
         assert not seq.block_table
         prefix_hash_id = -1
+        seq.pending_tail_copy = None
+
+        # 命中即偷走: 从哈希表摘下 bundle 并清掉块上的逐出标记。
+        # 必须先于后面的 allocate_block: 新块可能恰好弹到 bundle 的尾块或 state 块,
+        # 惰性逐出会抢先把 bundle 删掉, 这里的 remove 就落空了
+        if bundle:
+            bundles = self.linear_hash_table.get(bundle.parent_hash)
+            if bundles and bundle in bundles:
+                bundles.remove(bundle)
+            for state_block_id in bundle.state_cache_ids:
+                self.blocks[state_block_id].bundle = None
+            if bundle.tail_block_id is not None:
+                self.blocks[bundle.tail_block_id].bundle = None
+
+        # KV Cache block reuse
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
             prefix_hash_id = self.hash_block_tokens(prefix_hash_id, token_ids, seq.mm_hash_id)
@@ -133,24 +160,25 @@ class BlockManager:
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
         cached_tokens = num_cached_blocks * self.block_size
-        # 分配尾块
+
         if bundle and bundle.tail_block_id:
-            block = self.blocks[bundle.tail_block_id]
-            if bundle.tail_block_id in self.used_block_ids:
-                block.ref_count += 1
-            else:
-                block.ref_count = 1
-                self.free_block_ids.remove(bundle.tail_block_id)
-                self.used_block_ids.add(bundle.tail_block_id)
-            seq.block_table.append(bundle.tail_block_id)
+            dst = self.allocate_block()
+            seq.block_table.append(dst)
+            # src 已回 free list 时可能恰好弹到 src 自己: 前缀数据本就在块里, 无需拷贝
+            if dst != bundle.tail_block_id:
+                seq.pending_tail_copy = (bundle.tail_block_id, dst)
             num_cached_blocks += 1
+
+        # allocate new KV blocks
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self.allocate_block())
+
+        # allocate and reuse state blocks
         if self.has_linear_attention:
             assert seq.state_block_ids is None
             if bundle:
-                seq.state_block_ids = bundle.state_block_ids
-                for state_block_id in bundle.state_block_ids:
+                seq.state_block_ids = bundle.state_cache_ids
+                for state_block_id in seq.state_block_ids:
                     block = self.blocks[state_block_id]
                     if state_block_id in self.used_block_ids:
                         block.ref_count += 1
@@ -176,14 +204,17 @@ class BlockManager:
                 self.deallocate_block(block_id)
         if seq.state_block_ids is not None:
             for block_id in seq.state_block_ids:
-                self.blocks[block_id].ref_count -= 1
-                print(f"state_block_id: {block_id} ref_count: {self.blocks[block_id].ref_count}")
-                self.deallocate_block(block_id)
+                block = self.blocks[block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self.deallocate_block(block_id)
             seq.state_block_ids = None
         if seq.state_cache_ids is not None:
             for block_id in seq.state_cache_ids:
-                self.blocks[block_id].ref_count -= 1
-                self.deallocate_block(block_id)
+                block = self.blocks[block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self.deallocate_block(block_id)
             seq.state_cache_ids = None
         seq.num_cached_tokens = 0
         seq.block_table.clear()
@@ -212,12 +243,17 @@ class BlockManager:
     def record_linear_cached_blocks(self, seq: Sequence):
         num_cached_tokens, block_size = seq.num_cached_tokens, self.block_size
         num_blocks = num_cached_tokens // block_size
-        bundle = Bundle(
-            partial_token_ids=seq.token_ids[num_blocks * block_size : num_cached_tokens],
-            state_block_ids=list(seq.state_block_ids),
-            tail_block_id=seq.block_table[-1] if num_cached_tokens % block_size else None,   # 对齐时无尾块
-        )
         parent_hash = self.blocks[seq.block_table[num_blocks - 1]].hash if num_blocks > 0 else -1
+        bundle = Bundle(
+            parent_hash=parent_hash,
+            partial_token_ids=seq.token_ids[num_blocks * block_size : num_cached_tokens],
+            state_cache_ids=list(seq.state_cache_ids),
+            tail_block_id=seq.block_table[num_blocks] if num_cached_tokens % block_size else None,
+        )
+        for state_cache_id in bundle.state_cache_ids:
+            self.blocks[state_cache_id].bundle = bundle
+        if bundle.tail_block_id is not None:
+            self.blocks[bundle.tail_block_id].bundle = bundle
         self.linear_hash_table.setdefault(parent_hash, []).append(bundle)
         seq.store_linear_states = False
 

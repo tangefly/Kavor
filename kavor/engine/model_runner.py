@@ -222,7 +222,7 @@ class ModelRunner:
             return self.model.compute_logits(logits)
         else:
             bs = input_ids.size(0)
-            context = get_context()
+            context = get_context() 
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
@@ -358,6 +358,14 @@ class ModelRunner:
             self.cache.log_summary()
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        src_ids, dst_ids = [], []
+        for seq in seqs:
+            pending = seq.pending_tail_copy
+            seq.pending_tail_copy = None
+            if pending is not None:
+                src_ids.append(pending[0])
+                dst_ids.append(pending[1])
+        self.cache.copy_blocks(src_ids, dst_ids)
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
