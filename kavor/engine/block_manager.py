@@ -119,7 +119,8 @@ class BlockManager:
                 bundle = self.search_linear_states(prefix_hash_id, seq, num_cached_blocks)
             if bundle is not None and num_cached_blocks * self.block_size + len(bundle.partial_token_ids) >= seq.num_tokens:
                 bundle = None
-            if bundle == None:
+            
+            if self.has_linear_attention and bundle == None:
                 num_cached_blocks = 0
                 num_needed_blocks = seq.num_blocks
         # 需要 2 倍的 num_state_groups，一份保存快照，一份保存推理时变化的 states
@@ -161,7 +162,7 @@ class BlockManager:
             seq.block_table.append(block_id)
         cached_tokens = num_cached_blocks * self.block_size
 
-        if bundle and bundle.tail_block_id:
+        if bundle and bundle.tail_block_id is not None:
             dst = self.allocate_block()
             seq.block_table.append(dst)
             # src 已回 free list 时可能恰好弹到 src 自己: 前缀数据本就在块里, 无需拷贝
@@ -189,7 +190,7 @@ class BlockManager:
             else:
                 seq.state_block_ids = [self.allocate_block() for _ in range(self.num_state_groups)]
             seq.state_cache_ids = [self.allocate_block() for _ in range(self.num_state_groups)]
-        if bundle and bundle.tail_block_id:
+        if bundle and bundle.tail_block_id is not None:
             cached_tokens += len(bundle.partial_token_ids)
         seq.num_cached_tokens = cached_tokens
         if self.enable_prefix_cache:

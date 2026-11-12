@@ -62,9 +62,6 @@ class Scheduler:
                     if self.block_manager.enable_prefix_cache:
                         seq.stats.record_prefix_cache(seq.num_cached_tokens)
                 seq.num_scheduled_tokens = self.clamp_tokens(seq, num_tokens, remaining)
-                            
-                print(f"num_tokens: {seq.num_tokens}")
-                print(f"num_scheduled_tokens: {seq.num_scheduled_tokens}")
                 
                 num_batched_tokens += seq.num_scheduled_tokens
                 if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
