@@ -21,10 +21,10 @@ def store_kvcache_kernel(
     BLOCK_STRIDE: tl.constexpr,
 ):
     idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + idx)
+    slot = tl.load(slot_mapping_ptr + idx).to(tl.int64)
     if slot == -1: return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
+    key_offsets = idx.to(tl.int64) * key_stride + tl.arange(0, D)
+    value_offsets = idx.to(tl.int64) * value_stride + tl.arange(0, D)
     key = tl.load(key_ptr + key_offsets)
     value = tl.load(value_ptr + value_offsets)
     block = slot // BLOCK_SIZE
