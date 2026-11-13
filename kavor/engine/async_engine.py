@@ -99,6 +99,8 @@ class AsyncEngine:
     def _engine_loop(self):
         try:
             torch.cuda.set_device(self.engine.model_runner.rank)
+            step = (self.engine.profile_step
+                    if self.engine.config.profile else self.engine.step)
 
             while not self._shutdown:
                 self._drain_incoming()
@@ -109,8 +111,8 @@ class AsyncEngine:
                     self.new_request_event.wait()
                     self.new_request_event.clear()
                     continue
-                
-                outputs = self.engine.step()
+
+                outputs = step()
 
                 self._dispatch_running()
                 self._dispatch_finished(outputs)

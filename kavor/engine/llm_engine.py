@@ -39,6 +39,8 @@ class LLMEngine:
         self.ps = []
         self.events = []
         self._exiting = False
+        self.step_stats: list[dict] = []
+        self.request_stats: list[dict] = []
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
@@ -135,6 +137,49 @@ class LLMEngine:
 
         return outputs
 
+    def profile_step(self):
+        """带统计的 step(config.profile=True 时使用):step/request 级计时落
+        self.step_stats / self.request_stats,语义见 __init__ 注释。"""
+        start = perf_counter()
+        scheduled_seqs, is_prefill = self.scheduler.schedule()
+        # postprocess 会把 num_scheduled_tokens 清零,token 数必须在这之前取
+        num_tokens = sum(seq.num_scheduled_tokens for seq in scheduled_seqs)
+        forward = perf_counter()
+        token_ids = self.model_runner.call("run", scheduled_seqs, is_prefill)
+        forward_time = perf_counter() - forward
+        if is_prefill:
+            for seq in scheduled_seqs:
+                seq.stats.first_token_time = perf_counter()
+        self.scheduler.postprocess(scheduled_seqs, token_ids, is_prefill)
+        now = perf_counter()
+        self.step_stats.append({
+            "ts": now,
+            "prefill": is_prefill,
+            "tokens": num_tokens,
+            "step_time": now - start,
+            "forward_time": forward_time,
+        })
+        for seq in scheduled_seqs:
+            if seq.is_finished:
+                stats = seq.stats
+                stats.finish_time = now
+                self.request_stats.append({
+                    "seq_id": seq.seq_id,
+                    "request_id": seq.request_id,
+                    "num_prompt_tokens": seq.num_prompt_tokens,
+                    "num_completion_tokens": seq.num_completion_tokens,
+                    "arrival_time": stats.arrival_time,
+                    "prefill_start_time": stats.prefill_start_time,
+                    "first_token_time": stats.first_token_time,
+                    "finish_time": stats.finish_time,
+                    "prefix_cache_hit_tokens": stats.prefix_cache_hit_tokens,
+                })
+                self.log_request_stats(seq, now)
+        outputs = [(seq.seq_id, seq.completion_token_ids)
+                   for seq in scheduled_seqs if seq.is_finished]
+
+        return outputs
+
     def log_request_stats(self, seq: Sequence, finish: float):
         stats = seq.stats
         prompt = seq.num_prompt_tokens
@@ -189,6 +234,8 @@ class LLMEngine:
             elif isinstance(item, str):
                 token_ids = self.tokenizer.encode(item)
                 normalized.append(PromptInputs(token_ids, item))
+            elif isinstance(item, list):
+                normalized.append(PromptInputs(item, None))
             elif isinstance(item, int):
                 normalized.append(PromptInputs(torch.tensor(item), None))
             else:
@@ -201,7 +248,10 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
-        
+        # profile 模式下只保留最近一次 generate 的统计(warmup 调用天然自清)
+        if self.config.profile:
+            self.step_stats.clear()
+            self.request_stats.clear()
         inputs = self.normalize_inputs(inputs)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(inputs)
@@ -211,8 +261,9 @@ class LLMEngine:
         outputs = {}
 
         pbar = tqdm(total=len(inputs), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        step = self.profile_step if self.config.profile else self.step
         while not self.is_finished():
-            for seq_id, token_ids in self.step():
+            for seq_id, token_ids in step():
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()

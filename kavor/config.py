@@ -24,6 +24,7 @@ class Config:
     mm_cache_size_gb: float = 1.0
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    profile: bool = False
     trust_remote_code: bool = False
     hf_config: AutoConfig | None = None
     text_config: AutoConfig = None,

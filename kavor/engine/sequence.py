@@ -25,6 +25,7 @@ class SeqStats:
     arrival_time: float = field(default_factory=perf_counter)
     prefill_start_time: float | None = None
     first_token_time: float | None = None
+    finish_time: float | None = None
     prefix_cache_hit_tokens: int | None = None
     mm_hit_items: int = 0
     mm_total_items: int = 0

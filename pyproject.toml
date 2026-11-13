@@ -19,6 +19,7 @@ Homepage="https://github.com/tangefly/Kavor"
 [project.optional-dependencies]
 serve = ["fastapi", "uvicorn"]
 test = ["pytest"]
+bench = ["matplotlib"]
 
 [project.scripts]
 kavor = "kavor.interface.cli:main"
