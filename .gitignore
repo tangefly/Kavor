@@ -219,3 +219,6 @@ __marimo__/
 
 # Benchmark results
 benchs/results/
+
+# Agent
+.zcode/
