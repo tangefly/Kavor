@@ -10,13 +10,16 @@
     的 median。时间戳取自 vLLM RequestStateStats 的 engine core 单调钟
     (output_processor 内部算 decode_time 用的就是这对时间戳),等价于 Kavor 的
     (finish_time-first_token_time),窗口同样含 prefill 对 decode 的干扰;
-  - y 轴 decode tok/s per GPU: Σ(纯 decode step 的 generation tokens)/Σ(step 时长)/TP。
-    step 级数据来自 vLLM V1 的 SchedulerIterationDetails
-    (num_ctx_tokens/num_generation_tokens/elapsed_ms),elapsed_ms 在 engine core
-    侧环绕整个 iteration 计时。含 prefill chunk 的 step 整步剔除——vLLM 默认开
-    chunked prefill 时 prefill 会与 decode 混步,混步产出的 decode token 记入
-    summary.mixed_gen_tokens 不计入 y 轴(与 Kavor 的 is_prefill 过滤同义,
-    Kavor 无混步;通常占比 <5%,见 --disable-chunked-prefill);
+  - y 轴 decode tok/s per GPU: Σ(纯 decode step 的 generation tokens)/Σ(decode
+    相位墙钟)/TP。step 时长不能用 engine core 的 elapsed_ms——V1 异步调度下,
+    schedule(N+1) 与 GPU(N) 重叠,elapsed_ms 只计"重叠完之后剩余的等待尾巴"
+    (GPU − 被重叠的 CPU),把它当步时长会把流水线收益重复计价,算出的吞吐能
+    超过显存带宽物理上限。正确做法:在前端钩子上盖 perf_counter 时间戳 ts,
+    连续同相位 step 构成一个 run,run 墙钟 = ts[末] − ts[前一步](望远镜求和,
+    恰为该相位真实墙钟)。prefill chunk 混步仍整步剔除,混步 decode token 记
+    summary.mixed_gen_tokens 不计入 y 轴(与 Kavor 的 is_prefill 过滤同义);
+  - goodput: Σ(completion−1)/(max finish − min first_token),全部来自请求级
+    时间戳,与 engine 内部任何计时语义无关,两个引擎严格同口径(交叉验证用);
   - TTFT: first_token_ts-queued_ts(engine core 侧排队+prefill 时延,Kavor 用
     arrival_time,语义近似)。
 
@@ -33,6 +36,7 @@ import json
 import logging
 import random
 import statistics
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -84,8 +88,10 @@ def _percentile(values: list[float], q: float) -> float:
 class StepRecorder:
     """挂到 output_processor.update_scheduler_stats 上,抓每步 iteration details。
 
-    LLMEngine.step() 每步都会调用一次该函数(LLMEngine.py:326),stats 为 None
-    或 iteration_details 未填充(0-token step)时跳过。
+    LLMEngine.step() 每步都会调用一次该函数,stats 为 None 或 iteration_details
+    未填充(0-token step)时跳过。除 engine 侧数据外,每条记录盖一个前端
+    perf_counter 时间戳 ts——相邻两次回调的 ts 差就是一次迭代的真实墙钟
+    (含 engine core 排队/调度/等待全部环节),这是唯一跨引擎可比的步级时间。
     """
 
     def __init__(self, llm: LLM):
@@ -99,11 +105,18 @@ class StepRecorder:
             d = stats.iteration_details
             if d is not None and not d.is_dummy:
                 prefill = d.num_ctx_tokens > 0
+                ts = time.perf_counter()
+                prev_ts = self.steps[-1]["ts"] if self.steps else None
                 self.steps.append({
                     "prefill": prefill,
                     # prefill 步记 prompt token 数,decode 步记 generation token 数
                     "tokens": d.num_ctx_tokens if prefill else d.num_generation_tokens,
-                    "step_time": d.elapsed_ms / 1000.0,
+                    "ts": ts,
+                    # 本步墙钟 = 距上一条记录的时间差(首步无基准,记 None)
+                    "step_time": ts - prev_ts if prev_ts is not None else None,
+                    # 诊断用:engine core 侧计时。异步调度下只计"重叠后剩余的
+                    # 等待尾巴",不是步时长,禁止当吞吐分母(见模块 docstring)
+                    "engine_elapsed_s": d.elapsed_ms / 1000.0,
                     # 混步(prefill chunk + decode)中 decode 侧产出,不计入 y 轴
                     "mixed_gen_tokens": d.num_generation_tokens if prefill else 0,
                 })
@@ -113,15 +126,55 @@ class StepRecorder:
         self.steps.clear()
 
 
+def _phase_walls(step_stats: list[dict]) -> tuple[float, float]:
+    """按"连续同相位 run"累计墙钟:run[i..j] 的墙钟 = ts[j] − ts[i−1]。
+
+    相邻 step 的 ts 差 telescope 之后恰等于该相位的真实墙钟(含中间被跳过的
+    0-token step 和异步调度下只提交不等待的迭代)。另一相位的 step 会切断 run,
+    其耗时归它自己——与 Kavor 逐步计时的过滤语义一致。run 起点无前一步时
+    (实际上只会是开头的 prefill)从自身 ts 起算。
+    """
+    decode_time = prefill_time = 0.0
+    i, n = 0, len(step_stats)
+    while i < n:
+        j = i
+        while j + 1 < n and step_stats[j + 1]["prefill"] == step_stats[i]["prefill"]:
+            j += 1
+        start = step_stats[i - 1]["ts"] if i > 0 else step_stats[i]["ts"]
+        wall = step_stats[j]["ts"] - start
+        if step_stats[i]["prefill"]:
+            prefill_time += wall
+        else:
+            decode_time += wall
+        i = j + 1
+    return decode_time, prefill_time
+
+
+def _goodput(request_stats: list[dict]) -> float | None:
+    """Σ(completion−1) / (max finish − min first_token)。
+
+    分子分母全部来自请求级时间戳,与 engine 内部计时语义无关。
+    """
+    n = sum(r["num_completion_tokens"] - 1 for r in request_stats)
+    first = [r["first_token_time"] for r in request_stats
+             if r.get("first_token_time") is not None]
+    last = [r["finish_time"] for r in request_stats
+            if r.get("finish_time") is not None]
+    if n <= 0 or not first or not last:
+        return None
+    window = max(last) - min(first)
+    return n / window if window > 0 else None
+
+
 def summarize_run(request_stats: list[dict], step_stats: list[dict], tp: int) -> dict:
     """聚合一次 generate 的统计,键名与 Kavor 的 summarize_run 对齐。"""
     decode_steps = [s for s in step_stats if not s["prefill"]]
     prefill_steps = [s for s in step_stats if s["prefill"]]
     decode_tokens = sum(s["tokens"] for s in decode_steps)
-    decode_time = sum(s["step_time"] for s in decode_steps)
+    decode_time, prefill_time = _phase_walls(step_stats)
     prefill_tokens = sum(s["tokens"] for s in prefill_steps)
-    prefill_time = sum(s["step_time"] for s in prefill_steps)
     mixed_gen_tokens = sum(s["mixed_gen_tokens"] for s in prefill_steps)
+    goodput = _goodput(request_stats)
 
     per_user = []
     tpots_ms = []
@@ -149,6 +202,10 @@ def summarize_run(request_stats: list[dict], step_stats: list[dict], tp: int) ->
         } if per_user else None,
         "tpot_ms_median": statistics.median(tpots_ms) if tpots_ms else None,
         "ttft_s_median": statistics.median(ttfts_s) if ttfts_s else None,
+        # 请求级墙钟吞吐,交叉验证 decode_throughput(两者应同量级;
+        # goodput 窗口含 prefill 干扰,略低于纯 decode 相位口径属正常)
+        "goodput": goodput,
+        "goodput_per_gpu": goodput / tp if goodput else None,
         "prefill_tokens": prefill_tokens,
         "prefill_time": prefill_time,
         "prefill_throughput": prefill_tokens / prefill_time if prefill_time else 0.0,
@@ -250,6 +307,7 @@ def run_sweep(args) -> Path:
                   f"per-user {per_user['median']:7.1f} tok/s (median, "
                   f"TPOT {summary['tpot_ms_median']:.1f} ms), "
                   f"per-GPU {summary['decode_throughput_per_gpu']:8.1f} tok/s, "
+                  f"goodput {summary['goodput_per_gpu']:8.1f} tok/s/GPU, "
                   f"prefill {summary['prefill_throughput']:.0f} tok/s{mixed}")
             if not summary["consistent"]:
                 print(f"[warn] N={n} rep={rep}: decode step tokens 与请求侧计数不一致")

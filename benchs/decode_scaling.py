@@ -67,6 +67,23 @@ def _percentile(values: list[float], q: float) -> float:
     return statistics.quantiles(values, n=100, method="inclusive")[round(q) - 1]
 
 
+def _goodput(request_stats: list[dict]) -> float | None:
+    """Σ(completion−1) / (max finish − min first_token)。
+
+    分子分母全部来自请求级时间戳,与 engine 内部计时语义无关,
+    与 vllm_decode_scaling.py 的 _goodput 严格同口径(交叉验证用)。
+    """
+    n = sum(r["num_completion_tokens"] - 1 for r in request_stats)
+    first = [r["first_token_time"] for r in request_stats
+             if r.get("first_token_time") is not None]
+    last = [r["finish_time"] for r in request_stats
+            if r.get("finish_time") is not None]
+    if n <= 0 or not first or not last:
+        return None
+    window = max(last) - min(first)
+    return n / window if window > 0 else None
+
+
 def summarize_run(request_stats: list[dict], step_stats: list[dict], tp: int) -> dict:
     """聚合一次 generate 的引擎统计(llm.request_stats / llm.step_stats)。"""
     decode_steps = [s for s in step_stats if not s["prefill"]]
@@ -75,6 +92,7 @@ def summarize_run(request_stats: list[dict], step_stats: list[dict], tp: int) ->
     decode_time = sum(s["step_time"] for s in decode_steps)
     prefill_tokens = sum(s["tokens"] for s in prefill_steps)
     prefill_time = sum(s["step_time"] for s in prefill_steps)
+    goodput = _goodput(request_stats)
 
     per_user = []
     tpots_ms = []
@@ -102,6 +120,10 @@ def summarize_run(request_stats: list[dict], step_stats: list[dict], tp: int) ->
         } if per_user else None,
         "tpot_ms_median": statistics.median(tpots_ms) if tpots_ms else None,
         "ttft_s_median": statistics.median(ttfts_s) if ttfts_s else None,
+        # 请求级墙钟吞吐(含 prefill 干扰),交叉验证 decode_throughput;
+        # 同步引擎下 step_time 即墙钟,两者应基本一致
+        "goodput": goodput,
+        "goodput_per_gpu": goodput / tp if goodput else None,
         "prefill_tokens": prefill_tokens,
         "prefill_time": prefill_time,
         "prefill_throughput": prefill_tokens / prefill_time if prefill_time else 0.0,
@@ -169,14 +191,18 @@ def run_sweep(args) -> Path:
                 "concurrency": n,
                 "repeat": rep,
                 "summary": summary,
-                "request_stats": llm.request_stats,
-                "step_stats": llm.step_stats,
+                # 必须存快照:llm.request_stats / step_stats 是同一个 list,
+                # 下一次 generate 会被 clear() 原地复用,存引用会让所有 run
+                # 的归档数据都变成最后一个 run 的
+                "request_stats": list(llm.request_stats),
+                "step_stats": list(llm.step_stats),
             })
             per_user = summary["per_user_tokens_per_s"]
             print(f"N={n:>4} rep={rep}: "
                   f"per-user {per_user['median']:7.1f} tok/s (median, "
                   f"TPOT {summary['tpot_ms_median']:.1f} ms), "
                   f"per-GPU {summary['decode_throughput_per_gpu']:8.1f} tok/s, "
+                  f"goodput {summary['goodput_per_gpu']:8.1f} tok/s/GPU, "
                   f"prefill {summary['prefill_throughput']:.0f} tok/s")
             if not summary["consistent"]:
                 print(f"[warn] N={n} rep={rep}: decode step tokens 与请求侧计数不一致")

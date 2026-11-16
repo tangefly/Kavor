@@ -211,18 +211,19 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(
-        self, 
-        input_ids: torch.Tensor, 
-        positions: torch.Tensor, 
-        is_prefill: bool, 
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        is_prefill: bool,
         mm_kwargs: dict | None = None,
+        temperatures: torch.Tensor | None = None,
     ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs[-1]:
             logits = self.model(input_ids, positions, **(mm_kwargs or {}))
             return self.model.compute_logits(logits)
         else:
             bs = input_ids.size(0)
-            context = get_context() 
+            context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
@@ -235,6 +236,11 @@ class ModelRunner:
             if graph_vars["linear_slot_ids"] is not None:
                 graph_vars["linear_slot_ids"].fill_(self.cache.linear_padding_slot)
                 graph_vars["linear_slot_ids"][:bs] = context.linear_slot_ids
+            if self.graph_captures_head:
+                # lm_head + 采样在图内:温度写进持久 buffer,replay 直接产出 token
+                graph_vars["temperatures"][:bs].copy_(temperatures)
+                graph.replay()
+                return None
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -242,12 +248,16 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         try:
             mm_kwargs = self.mm_assembler.prepare(seqs) if is_prefill else {}
-            logits = self.run_model(input_ids, positions, is_prefill, mm_kwargs)
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            logits = self.run_model(input_ids, positions, is_prefill, mm_kwargs, temperatures)
         finally:
             self.mm_assembler.release_pins()
         self.cache.record_linear_states(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if logits is None:    # graph 已含 lm_head+采样
+            bs = input_ids.size(0)
+            token_ids = self.graph_vars["sampled_tokens"][:bs].tolist()
+        else:
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
@@ -263,6 +273,11 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, text_config.hidden_size)
+        temperatures = torch.ones(max_bs, dtype=torch.float32)
+        sampled_tokens = torch.zeros(max_bs, dtype=torch.int64)
+        # TP>1 时 ParallelLMHead 的 dist.gather(NCCL p2p 实现)进 CUDA graph
+        # 有挂死风险,lm_head+采样保持图外 eager
+        self.graph_captures_head = self.world_size == 1
         linear_slot_ids = (None if self.cache.linear_padding_slot is None else
                            torch.full((max_bs, self.cache.num_state_groups),
                                       self.cache.linear_padding_slot, dtype=torch.int64))
@@ -272,6 +287,10 @@ class ModelRunner:
             self.graph_bs.append(max_bs)
         self.graphs = {}
         self.graph_pool = None
+
+        def forward_with_head(bs):
+            logits = self.model.compute_logits(outputs[:bs])
+            self.sampler(logits, temperatures[:bs], out=sampled_tokens[:bs])
 
         pbar = tqdm(reversed(self.graph_bs), total=len(self.graph_bs),
                     desc="Capturing CUDA graphs", dynamic_ncols=True,
@@ -283,8 +302,12 @@ class ModelRunner:
                         block_tables=block_tables[:bs],
                         linear_slot_ids=None if linear_slot_ids is None else linear_slot_ids[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            if self.graph_captures_head:
+                forward_with_head(bs)    # 图内链路先 eager 一遍:JIT + 显存预算进池
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                if self.graph_captures_head:
+                    forward_with_head(bs)
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
@@ -299,6 +322,8 @@ class ModelRunner:
             block_tables=block_tables,
             linear_slot_ids=linear_slot_ids,
             outputs=outputs,
+            temperatures=temperatures,
+            sampled_tokens=sampled_tokens,
         )
 
     def allocate_kv_cache(self):

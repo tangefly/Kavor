@@ -14,21 +14,29 @@ try:
         fused_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
         chunk_gated_delta_rule,
     )
+    _HAS_FLA = True
 except ImportError:
     from kavor.layers.attention.gated_delta_rule import (
         torch_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
         torch_chunk_gated_delta_rule as chunk_gated_delta_rule
     )
+    _HAS_FLA = False
+
+from kavor.layers.attention.gated_delta_rule import fused_recurrent_gdn_decode
+from kavor.layers.attention.causal_conv1d import (
+    causal_conv1d_update_inplace,
+    varlen_causal_conv1d,
+)
 
 from kavor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-from kavor.layers.layernorm import RMSNorm
+from kavor.layers.layernorm import RMSNorm, RMSNormGated, rmsnorm_gemma
 from kavor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from kavor.layers.rotary_embedding import apply_rotary_emb
+from kavor.layers.rotary_embedding import apply_mrope_partial
 from kavor.utils.context import get_context
 from kavor.utils.mm_plan import plan_shards, visible_row_index
 
@@ -97,42 +105,8 @@ class Qwen3_5VisionRotaryEmbedding(nn.Module):
         return torch.cat([freq_hw, freq_hw], dim=-1)
 
 
-class Qwen3_5RMSNormGated(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6, **kwargs) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-        self.activation = "silu"
-
-    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        # Norm before gate
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = self.weight * hidden_states.to(input_dtype)
-        hidden_states = hidden_states * ACT2FN[self.activation](gate.to(torch.float32))
-
-        return hidden_states.to(input_dtype)
-
-
-def causal_conv1d_update(
-    hidden_states: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: nn.Parameter,
-    bias: nn.Parameter | None = None,
-    activation: str | None = None,
-):
-    _, hidden_size, seq_len = hidden_states.shape
-    state_len = conv_state.shape[-1]
-
-    hidden_states_new = torch.cat([conv_state, hidden_states], dim=-1).to(weight.dtype)
-    conv_state.copy_(hidden_states_new[:, :, -state_len:])
-    out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
-    out = out[:, :, -seq_len:]
-    if activation is not None:
-        out = ACT2FN[activation](out)
-    return out.to(hidden_states.dtype)
+# norm + silu(gate) 单 Triton kernel(数值路径同原 eager 实现,见 layernorm.py)
+Qwen3_5RMSNormGated = RMSNormGated
 
 
 def causal_conv1d_fn(
@@ -278,7 +252,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         return beta, g
 
-    def _split_qkv(self, mixed_qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _split_qkv(
+        self, mixed_qkv: torch.Tensor, expand_gqa: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = mixed_qkv.shape
         query, key, value = torch.split(
             mixed_qkv,
@@ -292,7 +268,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-        if self.num_v_heads // self.num_k_heads > 1:
+        if expand_gqa and self.num_v_heads // self.num_k_heads > 1:
+            # 融合路径(decode kernel / FLA varlen chunk)自带 GVA 映射,不展开;
+            # 只有纯 torch fallback 需要 q/k 头数与 v 对齐
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         return query, key, value
@@ -312,6 +290,98 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return self.out_proj(core_attn_out)
 
     def prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if _HAS_FLA:
+            return self._prefill_varlen(hidden_states)
+        return self._prefill_loop(hidden_states)
+
+    def _prefill_varlen(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """变长打包:整 batch 一次投影/卷积/chunk(cu_seqlens),替代逐序列 Python 循环。
+
+        旧实现 N 条序列 = 24 层 × N 次独立小 GEMM + chunk 调用,CPU 串行喂不动 GPU
+        (32K token prefill 只到 27% 利用率)。这里 qkv/z/a/b 全 batch 一次 GEMM,
+        conv 走 varlen Triton kernel(序列头部窗口从 conv 状态取),线性注意力走
+        FLA chunk 的 cu_seqlens 变长模式(GVA 直传,不展开 q/k)。
+        """
+        context = get_context()
+        cu_q_t = context.cu_seqlens_q
+        cu_k_t = context.cu_seqlens_k
+        slots_t = self.get_linear_slot_ids()                       # [N](任意 stride)
+        kernel_size = self.conv_kernel_size - 1
+        num_seqs = cu_q_t.numel() - 1
+        total_tokens = hidden_states.shape[0]
+
+        # 1) 全 batch 一次投影
+        mixed_qkv = self.in_proj_qkv(hidden_states)                # [T, conv_dim] 卷积前的值
+        z = self.in_proj_z(hidden_states)                          # [T, value_dim]
+        beta = self.in_proj_b(hidden_states).sigmoid()             # [T, HV]
+        a = self.in_proj_a(hidden_states)
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        # 2) conv:前缀序列的状态从池里取,fresh 序列补零;一个 kernel 卷完整个 batch
+        #    prefix/max_len 全部从 ctx 的 cu 张量在 GPU 上派生,避免每层 host->device 拷贝
+        prefix = (cu_k_t[1:] - cu_k_t[:-1]) > (cu_q_t[1:] - cu_q_t[:-1])
+        conv_states = mixed_qkv.new_zeros(num_seqs, self.conv_dim, kernel_size)
+        if prefix.any():
+            conv_states[prefix] = self.conv_pool[slots_t[prefix]]
+        max_len = int((cu_q_t[1:] - cu_q_t[:-1]).max())
+        conv_out = varlen_causal_conv1d(
+            mixed_qkv, cu_q_t, conv_states,
+            self.conv1d.weight.view(self.conv_dim, self.conv_kernel_size),
+            self.conv1d.bias, self.activation, max_len=max_len)
+
+        # 3) 新 conv 状态 = 各序列尾部 kernel_size 个输入 token,段太短处沿用旧状态
+        new_conv_states = self._tail_conv_states(mixed_qkv, cu_q_t, conv_states)
+
+        # 4) varlen chunk:初始状态只给有前缀的行,其余从零开始(同旧逻辑)
+        initial_state = None
+        if prefix.any():
+            initial_state = mixed_qkv.new_zeros(
+                num_seqs, self.num_v_heads, self.head_k_dim, self.head_v_dim,
+                dtype=torch.float32)
+            initial_state[prefix] = self.recurrent_pool[slots_t[prefix]]
+
+        query, key_states, value = self._split_qkv(conv_out.view(1, total_tokens, -1))
+        core_attn_out, last_state = chunk_gated_delta_rule(
+            query,
+            key_states,
+            value,
+            g=g.view(1, total_tokens, self.num_v_heads),
+            beta=beta.view(1, total_tokens, self.num_v_heads),
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=context.cu_seqlens_q,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # 5) 状态落池(tensor 索引,无 host 同步);bundle 命中的额外存一份
+        self.conv_pool[slots_t] = new_conv_states
+        self.recurrent_pool[slots_t] = last_state
+        cache_ids = context.linear_cache_slot_ids
+        if cache_ids is not None:
+            flags = context.states_store_flags
+            self.conv_pool[cache_ids[:, self.state_group][flags]] = new_conv_states[flags]
+            self.recurrent_pool[cache_ids[:, self.state_group][flags]] = last_state[flags]
+
+        return self._finalize(
+            core_attn_out, z.view(1, total_tokens, -1, self.head_v_dim), 1, total_tokens)[0]
+
+    def _tail_conv_states(self, mixed_qkv, cu_t, old_states):
+        """每序列的新 conv 状态:本段尾部 kernel_size 个输入 token;段长不足 kernel_size
+        时,左侧缺口沿用旧状态列(等价旧实现 cat([old_state, x]) 后取尾部)。
+        全程 GPU 张量运算,无 host 中转。"""
+        kernel_size = self.conv_kernel_size - 1
+        starts = cu_t[:-1]
+        pos = (cu_t[1:] - kernel_size).unsqueeze(1) + torch.arange(kernel_size, device=cu_t.device)
+        valid = pos >= starts[:, None]
+        new = mixed_qkv[pos.clamp_min(starts[:, None]).long()]                    # [N, k, C]
+        # 旧状态第 j 列对应 token (start - kernel_size + j),即 col = pos - start + kernel_size
+        old_cols = (pos - starts[:, None] + kernel_size).clamp(0, kernel_size - 1).long()
+        old = old_states.gather(
+            2, old_cols.unsqueeze(1).expand(-1, self.conv_dim, kernel_size))
+        return torch.where(valid[:, None], new.transpose(1, 2), old)
+
+    def _prefill_loop(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """FLA 缺失时的逐序列 eager 路径(慢,仅保底)。"""
         context = get_context()
         slot_ids = self.get_linear_slot_ids().tolist()
         cache_slot_ids, store_flags = self.get_linear_cache_slot_ids()
@@ -351,7 +421,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 ).transpose(1, 2)
                 initial_state = None
 
-            query, key_states, value = self._split_qkv(mixed_qkv)
+            query, key_states, value = self._split_qkv(mixed_qkv, expand_gqa=True)
             z = self.in_proj_z(x).reshape(1, seq_len, -1, self.head_v_dim)
             beta, g = self._beta_g(x, seq_len)
 
@@ -376,33 +446,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return torch.cat(outputs, dim=0)
 
     def decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        slot_ids = self.get_linear_slot_ids()                                          # [B] 本组的状态块 id
-        conv_states = self.conv_pool[slot_ids]                               # [B, conv_dim, k-1]
-        mixed_qkv = self.in_proj_qkv(hidden_states).unsqueeze(1).transpose(1, 2)    # [B, conv_dim, 1]
-        mixed_qkv = causal_conv1d_update(
+        slot_ids = self.get_linear_slot_ids()                      # [B] 本组的状态块 id
+        mixed_qkv = self.in_proj_qkv(hidden_states)                # [B, conv_dim]
+        # 单 kernel:conv(+silu) + conv 状态按 slot 原地前移,替代
+        # gather + cat + copy_ + conv1d + silu + scatter 六步
+        mixed_qkv = causal_conv1d_update_inplace(
             mixed_qkv,
-            conv_states,
-            self.conv1d.weight.squeeze(1),
+            self.conv_pool,
+            slot_ids,
+            self.conv1d.weight.view(self.conv_dim, self.conv_kernel_size),
             self.conv1d.bias,
             self.activation,
-        ).transpose(1, 2)
-        self.conv_pool[slot_ids] = conv_states
+        )
 
-        query, key_states, value = self._split_qkv(mixed_qkv)
+        query, key_states, value = self._split_qkv(mixed_qkv.unsqueeze(1))
         z = self.in_proj_z(hidden_states).reshape(-1, 1, self.num_v_heads, self.head_v_dim)
-        beta, g = self._beta_g(hidden_states, 1)
+        a = self.in_proj_a(hidden_states).view(-1, 1, self.num_v_heads)
+        b = self.in_proj_b(hidden_states).view(-1, 1, self.num_v_heads)
 
-        core_attn_out, last_recurrent_states = recurrent_gated_delta_rule(
+        # GDN 单步:状态池原地更新 + gate(a/b 的 softplus/sigmoid)核内计算
+        core_attn_out = fused_recurrent_gdn_decode(
             query,
             key_states,
             value,
-            g=g,
-            beta=beta,
-            initial_state=self.recurrent_pool[slot_ids],
-            output_final_state=True,
+            state_pool=self.recurrent_pool,
+            state_indices=slot_ids,
+            a=a,
+            b=b,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
             use_qk_l2norm_in_kernel=True,
         )
-        self.recurrent_pool[slot_ids] = last_recurrent_states
 
         return self._finalize(core_attn_out, z, slot_ids.numel(), 1)[:, 0]
 
@@ -475,6 +549,7 @@ class Qwen3_5MRotaryEmbedding(nn.Module):
 
     def __init__(self, rotary_dim: int, base: float, mrope_section):
         super().__init__()
+        self.rotary_dim = rotary_dim
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         freq_row = torch.zeros(inv_freq.numel(), dtype=torch.long)
         for dim, offset in enumerate((1, 2), start=1):      # dim=1 → H,dim=2 → W
@@ -483,15 +558,12 @@ class Qwen3_5MRotaryEmbedding(nn.Module):
         self.register_buffer("freq_row", freq_row, persistent=False)
 
     def forward(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor):
+        """原地 partial mrope:单 Triton kernel 旋转 q/k 的前 rotary_dim 列(rotate_half
+        语义,其余列原样),替代 eager 的 expand/mul/where/cos/sin/cat ~25 个算子。"""
         if positions.dim() == 1:    # 纯文本:三条流相同
             positions = positions.unsqueeze(0).expand(3, -1)
-        
-        freqs = positions.float()[:, :, None] * self.inv_freq[None, None, :]
-        picked = freqs[0]
-        for row in (1, 2):
-            picked = torch.where(self.freq_row == row, freqs[row], picked)
-        cos, sin = picked.cos().unsqueeze(1), picked.sin().unsqueeze(1)
-        return apply_rotary_emb(query, cos, sin), apply_rotary_emb(key, cos, sin)
+        apply_mrope_partial(positions, query, key, self.inv_freq, self.freq_row, self.rotary_dim)
+        return query, key
 
 
 class Qwen3_5Attention(nn.Module):
@@ -574,14 +646,8 @@ class Qwen3_5Attention(nn.Module):
         key_states = self.k_norm(key_states.view(hidden_shape))
         value_states = value_states.view(hidden_shape)
 
-        if self.rotary_dim == self.head_dim:
-            query_states, key_states = self.rotary_emb(position_ids, query_states, key_states)
-        else:
-            query_rot, key_rot = self.rotary_emb(
-                position_ids, query_states[..., : self.rotary_dim], key_states[..., : self.rotary_dim]
-            )
-            query_states = torch.cat([query_rot, query_states[..., self.rotary_dim :]], dim=-1)
-            key_states = torch.cat([key_rot, key_states[..., self.rotary_dim :]], dim=-1)
+        # 原地 partial mrope:kernel 只旋转前 rotary_dim 列,无需切片/拼接
+        self.rotary_emb(position_ids, query_states, key_states)
 
         attn_output = self.attn(query_states, key_states, value_states)
 
@@ -620,20 +686,19 @@ class Qwen3_5MLP(nn.Module):
 
 
 class Qwen3_5RMSNorm(nn.Module):
+    """Gemma 式 (1+w) RMSNorm;forward 走 Triton 融合(rmsnorm_gemma)。
+
+    weight 保持原始 w(不加 1):kernel 在 fp32 里加 1,与 eager 数值路径一致,
+    折进 bf16 权重会损失 ~2^-9 相对精度。
+    """
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
     def forward(self, x):
-        output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+        return rmsnorm_gemma(x, self.weight, self.eps)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
