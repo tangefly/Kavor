@@ -133,7 +133,8 @@ def causal_conv1d_fn(
 
 class Qwen3_5GatedDeltaNet(nn.Module):
 
-    def __init__(self, config: Qwen3_5Config, layer_idx: int):
+    def __init__(self, config: Qwen3_5Config, layer_idx: int,
+                 quant_config=None, prefix: str = ""):
         super().__init__()
         tp_size = dist.get_world_size()
         self.tp_size = tp_size
@@ -183,7 +184,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.A_log.weight_loader = self.v_head_weight_loader
 
         self.norm = Qwen3_5RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
-        self.out_proj = RowParallelLinear(self.total_value_dim, self.hidden_size, bias=False)
+        self.out_proj = RowParallelLinear(
+            self.total_value_dim, self.hidden_size, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.out_proj")
 
         self.layer_type = config.layer_types[layer_idx]
 
@@ -191,11 +194,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.hidden_size,
             [self.total_key_dim, self.total_key_dim, self.total_value_dim],
             bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.in_proj_qkv",
         )
         self.in_proj_qkv.weight.weight_loader = self.qkv_weight_loader
-        self.in_proj_z = ColumnParallelLinear(self.hidden_size, self.total_value_dim, bias=False)
-        self.in_proj_b = ColumnParallelLinear(self.hidden_size, self.total_num_v_heads, bias=False)
-        self.in_proj_a = ColumnParallelLinear(self.hidden_size, self.total_num_v_heads, bias=False)
+        if hasattr(self.in_proj_qkv, "weight_scale_inv"):
+            self.in_proj_qkv.weight_scale_inv.weight_loader = self.qkv_scale_loader
+        self.in_proj_z = ColumnParallelLinear(
+            self.hidden_size, self.total_value_dim, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.in_proj_z")
+        self.in_proj_b = ColumnParallelLinear(
+            self.hidden_size, self.total_num_v_heads, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.in_proj_b")
+        self.in_proj_a = ColumnParallelLinear(
+            self.hidden_size, self.total_num_v_heads, bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.in_proj_a")
 
         self.state_shapes = (
             (self.conv_dim, self.conv_kernel_size - 1),
@@ -214,6 +226,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         for shard_id, size in enumerate(self._qkv_segment_sizes()):
             MergedColumnParallelLinear.weight_loader(
                 self.in_proj_qkv, param, loaded_weight.narrow(0, offset, size), shard_id)
+            offset += size
+
+    def qkv_scale_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        """in_proj_qkv 的合并 scale 三段切,镜像 qkv_weight_loader:
+        2048/2048/6144 元素 == 16/16/48 个 block。"""
+        block_n = self.in_proj_qkv.weight_block_size[0]
+        offset = 0
+        for shard_id, size in enumerate(self._qkv_segment_sizes()):
+            MergedColumnParallelLinear.weight_loader(
+                self.in_proj_qkv, param,
+                loaded_weight.narrow(0, offset // block_n, size // block_n), shard_id)
             offset += size
 
     def conv_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -569,9 +592,10 @@ class Qwen3_5MRotaryEmbedding(nn.Module):
 class Qwen3_5Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int,
+                 quant_config=None, prefix: str = ""):
         super().__init__()
-        
+
         tp_size = dist.get_world_size()
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0, (
@@ -598,12 +622,14 @@ class Qwen3_5Attention(nn.Module):
             self.total_num_kv_heads,
             q_gate=True,    # attn_output_gate:q_proj 里 q 和门控拼在一起(q 占两份宽度)
             bias=self.qkv_bias,
+            quant_config=quant_config, prefix=f"{prefix}.qkv_proj",
         )
-        
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             config.attention_bias,
+            quant_config=quant_config, prefix=f"{prefix}.o_proj",
         )
         
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -659,9 +685,10 @@ class Qwen3_5Attention(nn.Module):
 
 
 class Qwen3_5MLP(nn.Module):
-    def __init__(self, config: Qwen3_5TextConfig, intermediate_size: int):
+    def __init__(self, config: Qwen3_5TextConfig, intermediate_size: int,
+                 quant_config=None, prefix: str = ""):
         super().__init__()
-        
+
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = intermediate_size
@@ -670,11 +697,13 @@ class Qwen3_5MLP(nn.Module):
             self.hidden_size,
             [self.intermediate_size] * 2,
             bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             self.intermediate_size,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiluAndMul()
 
@@ -705,15 +734,18 @@ class Qwen3_5RMSNorm(nn.Module):
 
 
 class Qwen3_5DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int,
+                 quant_config=None, prefix: str = ""):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.block_type = config.layer_types[layer_idx]
         if self.block_type == "linear_attention":
-            self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
+            self.linear_attn = Qwen3_5GatedDeltaNet(
+                config, layer_idx, quant_config, f"{prefix}.linear_attn")
         elif self.block_type == "full_attention":
-            self.self_attn = Qwen3_5Attention(config, layer_idx)
-        self.mlp = Qwen3_5MLP(config, config.intermediate_size)
+            self.self_attn = Qwen3_5Attention(
+                config, layer_idx, quant_config, f"{prefix}.self_attn")
+        self.mlp = Qwen3_5MLP(config, config.intermediate_size, quant_config, f"{prefix}.mlp")
         self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -982,12 +1014,14 @@ class Qwen3_5VisionModel(nn.Module):
 class Qwen3_5TextModel(nn.Module):
     config: Qwen3_5TextConfig
 
-    def __init__(self, config: Qwen3_5TextConfig):
+    def __init__(self, config: Qwen3_5TextConfig,
+                 quant_config=None, prefix: str = "model.language_model"):
         super().__init__()
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Qwen3_5DecoderLayer(config, layer_idx, quant_config, f"{prefix}.layers.{layer_idx}")
+             for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.has_linear_attention = any(t == "linear_attention" for t in config.layer_types)
@@ -1021,12 +1055,13 @@ class Qwen3_5Model(nn.Module):
     base_model_prefix = "model"
     accepts_loss_kwargs = False
 
-    def __init__(self, config):
+    def __init__(self, config, quant_config=None, prefix: str = "model"):
         super().__init__()
         self.config = config
         self.visual = Qwen3_5VisionModel(config.vision_config)
-        self.language_model = Qwen3_5TextModel(config.text_config)
-        self.rope_deltas = None 
+        self.language_model = Qwen3_5TextModel(
+            config.text_config, quant_config, f"{prefix}.language_model")
+        self.rope_deltas = None
 
     def get_vision_position_ids(
         self,
@@ -1344,7 +1379,7 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.model = Qwen3_5Model(config)
+        self.model = Qwen3_5Model(config, getattr(config, "quant_config", None))
         self.lm_head = ParallelLMHead(config.text_config.vocab_size, config.text_config.hidden_size)
         
         if config.text_config.tie_word_embeddings:

@@ -5,6 +5,7 @@ from torch import nn
 from tqdm import tqdm
 import torch
 
+from kavor.layers.quant import Fp8Config
 from kavor.utils.logger import logger
 
 from .model_mapping import MODEL_FOR_CAUSAL_LM_MAPPING
@@ -24,6 +25,11 @@ class AutoModelForCausalLM:
         **kwargs,
     ):
         model_class = cls._get_model_class(hfconfig)
+        # 量化配置挂到 config 上,模型构造时按模块路径(prefix)决定是否量化;
+        # fp8_mode 由引擎侧传入(w8a8 默认 / w8a16 切回权重侧量化路径)
+        hfconfig.quant_config = Fp8Config.from_config(
+            getattr(hfconfig, "quantization_config", None),
+            fp8_mode=kwargs.get("fp8_mode", "w8a8"))
         model = model_class(hfconfig)
         cls.load_weight(model, hfconfig.name_or_path, use_tqdm)
         return model
