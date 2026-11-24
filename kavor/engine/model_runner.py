@@ -11,7 +11,7 @@ from kavor.engine.cache_pool import CachePool
 from kavor.engine.mm_cache import MMCache
 from kavor.engine.mm_assembler import MMInputAssembler
 from kavor.engine.sequence import Sequence
-from kavor.layers.sampler import Sampler
+from kavor.kernels.sampler import Sampler
 from kavor.utils.context import set_context, get_context, reset_context
 from kavor.utils.logger import logger
 from kavor.models import AutoModelForCausalLM
@@ -38,7 +38,7 @@ class ModelRunner:
         torch.set_default_device("cuda")
         Sequence.block_size = config.kvcache_block_size
         self.model = AutoModelForCausalLM.from_pretrained(
-            hf_config, use_tqdm=self.enable_log, fp8_mode=config.fp8_mode)
+            hf_config, use_tqdm=self.enable_log, fp8_backend=config.fp8_backend)
         self.sampler = Sampler()
         self.mm_cache = None
         self.allocate_kv_cache()

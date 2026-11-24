@@ -13,12 +13,12 @@ from types import SimpleNamespace
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 
-from kavor.layers import fp8_flashinfer  # noqa: E402
-from kavor.layers.fp8_kernel import fp8_blockwise_linear  # noqa: E402
-from kavor.layers.fp8_utils import (  # noqa: E402
+import kavor.kernels.fp8.flashinfer as fp8_flashinfer  # noqa: E402
+from kavor.kernels.fp8.triton_w8a16 import fp8_blockwise_linear  # noqa: E402
+from kavor.kernels.fp8.triton_w8a8 import (  # noqa: E402
     per_token_group_quant_fp8, w8a8_block_fp8_linear, w8a8_block_fp8_matmul)
-from kavor.layers.quant import (  # noqa: E402
-    W8A16_MAX_M, Fp8BlockLinearMethod, Fp8Config)
+from kavor.layers.quant.fp8 import (  # noqa: E402
+    Fp8BlockLinearMethod, Fp8Config)
 
 DEV = "cuda"
 FP8 = torch.float8_e4m3fn
@@ -135,26 +135,30 @@ def test_w8a8_block_fp8_linear_3d_input():
     _assert_quant_noise(out, ref)
 
 
-def _make_method(fp8_mode):
-    config = Fp8Config((128, 128), modules_to_not_convert=[], fp8_mode=fp8_mode)
+def _make_method(backend):
+    config = Fp8Config((128, 128), modules_to_not_convert=[], fp8_backend=backend)
     return Fp8BlockLinearMethod(config)
 
 
+def _make_layer(w_q, w_s, bias=None):
+    return SimpleNamespace(
+        weight=w_q, weight_scale_inv=w_s, bias=bias,
+        weight_block_size=(128, 128), orig_dtype=torch.bfloat16)
+
+
 def test_fp8_linear_method_routing():
-    """fp8_mode 决定 apply 走 W8A8(vendored)还是 W8A16(kavor kernel)。"""
+    """显式 backend 时 apply 走对应 kernel;两条 Triton 路径都要对齐参考实现。"""
     torch.manual_seed(0)
     M, N, K = 33, 256, 384
     x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
     w = torch.randn(N, K, dtype=torch.bfloat16, device=DEV) / 16
     w_q, w_s = _quant_weight_blockwise(w)
-    layer = SimpleNamespace(weight=w_q, weight_scale_inv=w_s)
 
-    out8 = _make_method("w8a8").apply(layer, x, None)
-    out16 = _make_method("w8a16").apply(layer, x, None)
+    out8 = _make_method("triton_w8a8").apply(_make_layer(w_q, w_s), x, None)
+    out16 = _make_method("triton_w8a16").apply(_make_layer(w_q, w_s), x, None)
 
     torch.testing.assert_close(out8, w8a8_block_fp8_linear(x, w_q, w_s, (128, 128)))
-    torch.testing.assert_close(
-        out16, fp8_blockwise_linear(x, w_q, w_s, None))
+    torch.testing.assert_close(out16, fp8_blockwise_linear(x, w_q, w_s, None))
 
     # 两条路径都应落在量化噪声量级内(相对 bf16 oracle)
     ref = F.linear(x, _dequant_blockwise(w_q, w_s))
@@ -162,26 +166,30 @@ def test_fp8_linear_method_routing():
     _assert_quant_noise(out16, ref)
 
 
-def test_fp8_linear_method_auto_routing():
-    """auto:能走 FlashInfer 就全走;否则 decode 小 M 走 w8a16、prefill 大 M 走 w8a8。"""
+def test_fp8_linear_method_auto_picks_one_kernel():
+    """auto 在 prepare 阶段固定一个 kernel,不再按 M 分流。"""
+    from kavor.kernels.fp8 import marlin_build
+
     torch.manual_seed(0)
     N, K = 256, 384
     w = torch.randn(N, K, dtype=torch.bfloat16, device=DEV) / 16
     w_q, w_s = _quant_weight_blockwise(w)
-    layer = SimpleNamespace(weight=w_q, weight_scale_inv=w_s)
     method = _make_method("auto")
-    use_fi = fp8_flashinfer.supports(
-        torch.empty(1, K, dtype=torch.bfloat16, device=DEV), w_q, w_s)
+    layer = _make_layer(w_q, w_s)
+    method.prepare_kernel(layer)
 
-    for M in (1, 16, 32, 33, 64, 256):
+    if fp8_flashinfer.flashinfer_available():
+        expected = "flashinfer"
+    elif marlin_build.marlin_available()[0]:
+        expected = "marlin"
+    else:
+        expected = "triton_w8a16"
+    assert method.kernel.name == expected
+
+    for M in (1, 32, 64, 256):
         x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
-        if use_fi:
-            expected = fp8_flashinfer.flashinfer_block_fp8_linear(x, w_q, w_s)
-        elif M <= W8A16_MAX_M:
-            expected = fp8_blockwise_linear(x, w_q, w_s, None)
-        else:
-            expected = w8a8_block_fp8_linear(x, w_q, w_s, (128, 128))
-        torch.testing.assert_close(method.apply(layer, x, None), expected)
+        ref = F.linear(x, _dequant_blockwise(w_q, w_s))
+        _assert_quant_noise(method.apply(layer, x, None), ref)
 
 
 def test_flashinfer_block_fp8_linear_matches_reference():
@@ -245,31 +253,30 @@ def test_flashinfer_import_failure_falls_back(monkeypatch):
         torch.empty(4, 4, dtype=torch.float32, device=DEV))
 
 
-def test_flashinfer_mode_requires_availability(monkeypatch):
-    """fp8_mode='flashinfer' 但在没有 FlashInfer 的机器上加载要直接报错。"""
+def test_flashinfer_backend_requires_availability(monkeypatch):
+    """fp8_backend='flashinfer' 但在没有 FlashInfer 的机器上加载要直接报错。"""
     _no_flashinfer(monkeypatch)
+    torch.manual_seed(0)
+    w = torch.randn(512, 512, dtype=torch.bfloat16, device=DEV) / 16
+    w_q, w_s = _quant_weight_blockwise(w)
 
-    class Layer(torch.nn.Module):
-        pass
-
-    with pytest.raises(AssertionError, match="FlashInfer 不可用"):
-        _make_method("flashinfer").create_weights(
-            Layer(), input_size=512, output_size=512, weight_loader=None)
+    with pytest.raises(RuntimeError, match="flashinfer"):
+        _make_method("flashinfer").prepare_kernel(_make_layer(w_q, w_s))
 
 
-def test_fp8_config_from_config_parses_mode():
+def test_fp8_config_from_config_parses_backend():
     quant_config = {
         "quant_method": "fp8",
         "fmt": "e4m3",
         "activation_scheme": "dynamic",
         "weight_block_size": [128, 128],
     }
-    cfg = Fp8Config.from_config(quant_config, fp8_mode="w8a16")
-    assert cfg.fp8_mode == "w8a16"
+    cfg = Fp8Config.from_config(quant_config, fp8_backend="triton_w8a16")
+    assert cfg.fp8_backend == "triton_w8a16"
     assert cfg.activation_scheme == "dynamic"
     assert cfg.weight_block_size == (128, 128)
-    assert Fp8Config.from_config(quant_config, fp8_mode="auto").fp8_mode == "auto"
+    assert Fp8Config.from_config(quant_config).fp8_backend == "auto"
 
     assert Fp8Config.from_config(None) is None          # 非量化模型
     with pytest.raises(AssertionError):
-        Fp8Config.from_config(quant_config, fp8_mode="w4a16")
+        Fp8Config.from_config(quant_config, fp8_backend="w4a16")

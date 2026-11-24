@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 
-from kavor.layers.quant import BlockQuantScaleParameter, UnquantizedLinearMethod
+from kavor.layers.quant.base import BlockQuantScaleParameter, UnquantizedLinearMethod
 
 
 def divide(numerator, denominator):

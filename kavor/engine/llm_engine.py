@@ -31,6 +31,10 @@ def _worker_entry(config: Config, rank: int, event):
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        if "fp8_mode" in kwargs:
+            raise ValueError(
+                "fp8_mode 已废弃,请改用 fp8_backend"
+                "(auto/flashinfer/marlin/triton_w8a16/triton_w8a8)")
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)

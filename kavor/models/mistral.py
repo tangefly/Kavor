@@ -3,12 +3,12 @@ from torch import nn
 import torch.distributed as dist
 from transformers import MistralConfig
 
-from kavor.layers.activation import SiluAndMul
-from kavor.layers.attention.flash_attention_kvcache import Attention
+from kavor.kernels.activation import SiluAndMul
+from kavor.kernels.attention.flash_attention_kvcache import Attention
 from kavor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-from kavor.layers.layernorm import RMSNorm
+from kavor.kernels.layernorm import RMSNorm
 from kavor.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from kavor.layers.rotary_embedding import get_rope
+from kavor.kernels.rotary_embedding import get_rope
 
 class MistralMLP(nn.Module):
     def __init__(self, config: MistralConfig):

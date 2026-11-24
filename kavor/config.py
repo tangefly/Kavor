@@ -36,14 +36,17 @@ class Config:
     has_linear_attention: bool = False
     num_linear_state_groups: int = 0
     snapshot_decode_states: bool = False
-    fp8_mode: str = "auto"
+    fp8_backend: str = "auto"
 
     def __post_init__(self):
         if not os.path.isdir(self.model):
             raise RuntimeError(f"Model not found: {self.model}")
-        assert self.fp8_mode in ("w8a8", "w8a16", "auto", "flashinfer"), (
-            f"fp8_mode 只支持 'w8a8' / 'w8a16' / 'auto' / 'flashinfer',"
-            f"遇到 {self.fp8_mode!r}")
+        # 与 kavor/kernels/fp8/registry.py 的 BACKENDS 保持一致;这里不 import
+        # registry,避免 Config 在 CPU-only 环境也把 triton 拖进来。
+        assert self.fp8_backend in (
+            "auto", "flashinfer", "marlin", "triton_w8a16", "triton_w8a8"), (
+            f"fp8_backend 只支持 'auto' / 'flashinfer' / 'marlin' / "
+            f"'triton_w8a16' / 'triton_w8a8',遇到 {self.fp8_backend!r}")
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.mm_cache_size_gb >= 0, "mm_cache_size_gb 不能为负"

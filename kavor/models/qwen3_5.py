@@ -6,8 +6,8 @@ import torch
 from torch import nn
 import torch.distributed as dist
 
-from kavor.layers.activation import SiluAndMul
-from kavor.layers.attention.flash_attention_kvcache import Attention
+from kavor.kernels.activation import SiluAndMul
+from kavor.kernels.attention.flash_attention_kvcache import Attention
 
 try:
     from fla.ops.gated_delta_rule import (
@@ -16,7 +16,7 @@ try:
     )
     _HAS_FLA = True
 except ImportError:
-    from kavor.layers.attention.gated_delta_rule import (
+    from kavor.kernels.attention.gated_delta_rule import (
         torch_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
         torch_chunk_gated_delta_rule as chunk_gated_delta_rule
     )
@@ -26,21 +26,21 @@ except ImportError:
         "未安装 flash-linear-attention,线性注意力 prefill 回退到纯 torch 实现"
         "(慢 1.6x 左右):pip install 'flash-linear-attention[cuda]'")
 
-from kavor.layers.attention.gated_delta_rule import fused_recurrent_gdn_decode
-from kavor.layers.attention.causal_conv1d import (
+from kavor.kernels.attention.gated_delta_rule import fused_recurrent_gdn_decode
+from kavor.kernels.attention.causal_conv1d import (
     causal_conv1d_update_inplace,
     varlen_causal_conv1d,
 )
 
 from kavor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-from kavor.layers.layernorm import RMSNorm, RMSNormGated, rmsnorm_gemma
+from kavor.kernels.layernorm import RMSNorm, RMSNormGated, rmsnorm_gemma
 from kavor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from kavor.layers.rotary_embedding import apply_mrope_partial
+from kavor.kernels.rotary_embedding import apply_mrope_partial
 from kavor.utils.context import get_context
 from kavor.utils.mm_plan import plan_shards, visible_row_index
 

@@ -9,11 +9,11 @@ import torch.nn.functional as F
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 
-from kavor.layers.layernorm import RMSNorm  # noqa: E402
-from kavor.layers.rotary_embedding import (  # noqa: E402
+from kavor.kernels.layernorm import RMSNorm  # noqa: E402
+from kavor.kernels.rotary_embedding import (  # noqa: E402
     RotaryEmbedding, apply_rotary_emb, apply_rotary_emb_interleaved)
-from kavor.layers.sampler import Sampler  # noqa: E402
-from kavor.layers.attention.gated_delta_rule import fused_recurrent_gdn_decode  # noqa: E402
+from kavor.kernels.sampler import Sampler  # noqa: E402
+from kavor.kernels.attention.gated_delta_rule import fused_recurrent_gdn_decode  # noqa: E402
 
 DEV = "cuda"
 EPS = 1e-6
@@ -302,9 +302,9 @@ def test_gdn_decode_cuda_graph_replay_with_new_indices():
 # 原地 + varlen)、GDN gate 核内计算 —— 全部与原 eager 实现对拍。
 # ---------------------------------------------------------------------------
 
-from kavor.layers.layernorm import RMSNormGated, rmsnorm_gemma  # noqa: E402
-from kavor.layers.rotary_embedding import apply_mrope_partial  # noqa: E402
-from kavor.layers.attention.causal_conv1d import (  # noqa: E402
+from kavor.kernels.layernorm import RMSNormGated, rmsnorm_gemma  # noqa: E402
+from kavor.kernels.rotary_embedding import apply_mrope_partial  # noqa: E402
+from kavor.kernels.attention.causal_conv1d import (  # noqa: E402
     causal_conv1d_update_inplace, varlen_causal_conv1d)
 
 

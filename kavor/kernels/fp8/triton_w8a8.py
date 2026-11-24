@@ -8,7 +8,7 @@
 # Kavor 侧适配(其余保持上游原样,便于日后对照升级):
 #   - 只保留 Triton 路径:去掉 torch.ops._C 原生算子、cutlass / deepgemm /
 #     rocm-aiter 分发,以及只为这些后端服务的 column-major / TMA 对齐 scale
-#     变体(W8A16 路径在 kavor/layers/fp8_kernel.py,与本文件互不影响);
+#     变体(W8A16 路径在 kavor/kernels/fp8/triton_w8a16.py,与本文件互不影响);
 #   - fp8 dtype 固定 torch.float8_e4m3fn(Kavor 只支持 e4m3,见 Fp8Config);
 #   - device name / logger 换成本地实现;
 #   - 新增 w8a8_block_fp8_linear 作为 LinearMethod.apply 的入口。

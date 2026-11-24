@@ -30,11 +30,11 @@ def add_server_args(parser: argparse.ArgumentParser):
         help="允许加载 tokenizer 时执行模型目录里的自定义代码。模型 config 由 Kavor 自己解析,不受此开关影响")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument(
-        "--fp8-mode", default="auto",
-        choices=("auto", "flashinfer", "w8a8", "w8a16"),
-        help="FP8 模型的激活侧计算路径:auto=能走 FlashInfer 就走,否则按 M 分流"
-             "(decode 走 w8a16、prefill 走 w8a8);flashinfer=强制 FlashInfer/DeepGEMM "
-             "block GEMM;w8a8/w8a16=固定 Triton 路径")
+        "--fp8-backend", default="auto",
+        choices=("auto", "flashinfer", "marlin", "triton_w8a16", "triton_w8a8"),
+        help="FP8 线性层的 GEMM 后端:auto=按优先级自动选择"
+             "(SM90 优先 FlashInfer,其余优先 Marlin);flashinfer=FlashInfer/DeepGEMM;"
+             "marlin=vendored Marlin W8A16;triton_w8a16/triton_w8a8=固定 Triton 路径")
     parser.add_argument(
         "--mm-max-pixels", type=int, default=1280 * 28 * 28,
         help="多模态请求里每张图(视频为每帧)的像素上限,超了会等比缩小;"

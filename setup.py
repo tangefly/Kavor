@@ -308,4 +308,21 @@ def get_requirements():
     return req
 
 
-setup(install_requires=get_requirements())
+setup(
+    install_requires=get_requirements(),
+    # Marlin 的 CUDA 源码随包分发,首次使用时 JIT 编译(见
+    # kavor/kernels/fp8/marlin_build.py)。kavor/csrc 不是 Python 包,
+    # 所以要在这里显式声明为 kavor 包的 data files。
+    package_data={
+        "kavor": [
+            "csrc/marlin/*.cu",
+            "csrc/marlin/*.cuh",
+            "csrc/marlin/*.h",
+            "csrc/marlin/*.py",
+            "csrc/marlin/*.md",
+            "csrc/marlin/LICENSE.vllm",
+            "csrc/marlin/NOTICE",
+            "csrc/marlin/generated/*",
+        ],
+    },
+)

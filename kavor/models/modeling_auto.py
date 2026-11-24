@@ -5,7 +5,7 @@ from torch import nn
 from tqdm import tqdm
 import torch
 
-from kavor.layers.quant import Fp8Config
+from kavor.layers.quant.fp8 import Fp8Config
 from kavor.utils.logger import logger
 
 from .model_mapping import MODEL_FOR_CAUSAL_LM_MAPPING
@@ -26,13 +26,29 @@ class AutoModelForCausalLM:
     ):
         model_class = cls._get_model_class(hfconfig)
         # 量化配置挂到 config 上,模型构造时按模块路径(prefix)决定是否量化;
-        # fp8_mode 由引擎侧传入(w8a8/w8a16 固定路径,或 auto 按 M 分流)
+        # fp8_backend 由引擎侧传入;auto 时按 registry 的优先级选择
         hfconfig.quant_config = Fp8Config.from_config(
             getattr(hfconfig, "quantization_config", None),
-            fp8_mode=kwargs.get("fp8_mode", "auto"))
+            fp8_backend=kwargs.get("fp8_backend", "auto"))
         model = model_class(hfconfig)
         cls.load_weight(model, hfconfig.name_or_path, use_tqdm)
+        cls._prepare_quantized_layers(model)
         return model
+
+    @classmethod
+    def _prepare_quantized_layers(cls, model: nn.Module) -> None:
+        """权重加载完成后,让每个量化 Linear 选 kernel 并做一次性布局转换。
+
+        必须在 KV cache 分配和 CUDA graph capture 之前执行(见 model_runner)。
+        """
+        prepared = 0
+        for module in model.modules():
+            method = getattr(module, "quant_method", None)
+            if method is not None and hasattr(method, "prepare_kernel"):
+                method.prepare_kernel(module)
+                prepared += 1
+        if prepared:
+            logger.info("已为 %d 个 FP8 线性层准备 kernel", prepared)
 
     @classmethod
     def _get_model_class(

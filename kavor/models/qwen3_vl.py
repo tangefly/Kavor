@@ -12,16 +12,16 @@ from transformers.vision_utils import (
     get_vision_position_ids,
 )
 
-from kavor.layers.activation import SiluAndMul
-from kavor.layers.attention.flash_attention_kvcache import Attention
+from kavor.kernels.activation import SiluAndMul
+from kavor.kernels.attention.flash_attention_kvcache import Attention
 from kavor.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
-from kavor.layers.layernorm import RMSNorm
+from kavor.kernels.layernorm import RMSNorm
 from kavor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from kavor.layers.rotary_embedding import apply_rotary_emb
+from kavor.kernels.rotary_embedding import apply_rotary_emb
 from kavor.utils.mm_plan import plan_shards, visible_row_index
 
 
