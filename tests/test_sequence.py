@@ -51,8 +51,7 @@ def test_pickle_prefill_carries_full_tokens(make_seq):
     assert seq.is_prefill
     seq.block_table = [7, 8]
     seq.state_block_ids = [9]
-    seq.state_cache_ids = [10, 11]
-    seq.pending_tail_copy = (1, 2)
+    seq.state_copy_src = [10, 11]
     seq.num_cached_tokens = 4
     seq.num_scheduled_tokens = 1
 
@@ -63,8 +62,7 @@ def test_pickle_prefill_carries_full_tokens(make_seq):
     assert data.num_cached_tokens == 4 and data.num_scheduled_tokens == 1
     assert data.block_table == [7, 8]
     assert data.state_block_ids == [9]
-    assert data.state_cache_ids == [10, 11]
-    assert data.pending_tail_copy == (1, 2)
+    assert data.state_copy_src == [10, 11]      # worker 要据此在 forward 前发 copy
     assert data.stats is None                   # 统计只在引擎侧
 
 

@@ -1,4 +1,4 @@
-"""BlockManager 单元测试:块分配、prefix cache 命中/复用、linear attention bundle。
+"""BlockManager 单元测试:块分配、prefix cache 命中/复用、linear attention 的 chunk 状态快照。
 
 全部纯 CPU,不依赖模型与 GPU。
 """
@@ -178,101 +178,255 @@ def test_may_append_block_grows_only_at_boundary(make_seq):
     assert len(seq.block_table) == 2
 
 
-# ---------------------------------------------------------------- linear attention bundle
+# ---------------------------------------------------------------- linear attention chunk state
 
-SNAP_TOKEN = 248068   # 与 scheduler.clamp_tokens 中 Qwen3.5 的快照边界 token 一致
+def _linear_bm(num_blocks: int = 24) -> BlockManager:
+    return BlockManager(num_blocks=num_blocks, block_size=TEST_BLOCK_SIZE,
+                        has_linear_attention=True, num_state_groups=2)
 
 
-def _record_start_bundle(bm, seq, num_chunk_tokens):
-    """模拟分块 prefill 的第一段:停在快照边界前,记录 linear states bundle。"""
-    seq.num_scheduled_tokens = num_chunk_tokens
-    bm.hash_blocks(seq)                         # 不足整块时不产生哈希
-    seq.num_cached_tokens += num_chunk_tokens
-    bm.record_linear_cached_blocks(seq)
+def _run_step(bm: BlockManager, seq, num_tokens: int, rotate: bool = True):
+    """模拟一步 forward 之后的 postprocess:整块哈希 → 释放上一步的 copy 源 → 推进 → 过边界就冻结。"""
+    seq.num_scheduled_tokens = num_tokens
+    bm.hash_blocks(seq)
+    bm.release_state_copy(seq)
+    seq.num_cached_tokens += num_tokens
     seq.num_scheduled_tokens = 0
+    bm.cache_linear_state(seq, rotate=rotate)
 
 
-def test_linear_prefill_needs_state_block_budget(make_seq):
-    # 1 个 KV 块 + 2 组 state × (推理 + 快照) = 5 块;池 6 减占位块刚好剩 5
-    bm = BlockManager(num_blocks=6, block_size=TEST_BLOCK_SIZE,
+def test_linear_prefill_budget_counts_only_resident_blocks(make_seq):
+    # 1 个 KV 块 + 2 个可变状态块 = 3 块
+    bm = BlockManager(num_blocks=4, block_size=TEST_BLOCK_SIZE,
                       has_linear_attention=True, num_state_groups=2)
     seq = make_seq([1, 2, 3])
-    cached, bundle = bm.can_allocate_prefill(seq)
-    assert (cached, bundle) == (0, None)
+    assert bm.can_allocate_prefill(seq) == (0, None)
     bm.allocate_prefill(seq, 0, None)
     assert len(seq.state_block_ids) == 2
-    assert len(seq.state_cache_ids) == 2
+    assert seq.state_copy_src is None          # 从头算,没有快照要 copy
+    assert not bm.free_block_ids                # 3 块正好用完
 
-    bm2 = BlockManager(num_blocks=5, block_size=TEST_BLOCK_SIZE,
+    # 池再小一块就装不下:4 块池 - 1 占位 = 3,还差一个
+    bm2 = BlockManager(num_blocks=3, block_size=TEST_BLOCK_SIZE,
                        has_linear_attention=True, num_state_groups=2)
     assert bm2.can_allocate_prefill(make_seq([1, 2, 3])) == (-1, None)
 
 
-def test_linear_bundle_record_search_and_adopt(make_seq):
-    bm = BlockManager(num_blocks=24, block_size=TEST_BLOCK_SIZE,
-                      has_linear_attention=True, num_state_groups=2)
-    tokens1 = [1, 2, 3, SNAP_TOKEN, 5, 6, 7, 8, 9]
-    seq1 = make_seq(tokens1)
+def test_chunk_boundary_freezes_state_and_rotates_blocks(make_seq):
+    bm = _linear_bm()
+    seq = make_seq(list(range(12)))             # 3 个整块
+    bm.allocate_prefill(seq, 0, None)
+    working = list(seq.state_block_ids)
+
+    _run_step(bm, seq, 4)                       # 第一步正好停在第一个 chunk 边界
+    block_hash = bm.blocks[seq.block_table[0]].hash
+    assert bm.linear_hash_to_block_id == {block_hash: working}
+    assert bm.linear_state_cached == 1
+    # 换了一组新块接着算;旧块先留给 copy,仍被本序列持有,不会被逐出
+    assert seq.state_copy_src == working
+    assert not set(seq.state_block_ids) & set(working)
+    assert all(bm.blocks[b].ref_count == 1 for b in working)
+    assert not set(working) & set(bm.free_block_ids)
+
+    _run_step(bm, seq, 2)                       # copy 发完的那一步;停在块中间
+    assert seq.state_copy_src is None
+    assert all(b in bm.free_block_ids for b in working)     # 归还到 free list 尾部
+    assert all(bm.blocks[b].ref_count == 0 for b in working)
+    assert bm.linear_hash_to_block_id == {block_hash: working}   # 登记还在,别人能命中
+    assert bm.linear_state_cached == 1          # 块中间不产生新快照
+
+
+def test_state_snapshot_is_keyed_by_the_kv_block_hash(make_seq):
+    """第 k+1 个 chunk 走完后的状态,和第 k 个 KV 块描述同一段前缀:用同一个哈希登记。"""
+    bm = _linear_bm()
+    seq = make_seq(list(range(8)))
+    bm.allocate_prefill(seq, 0, None)
+    _run_step(bm, seq, 4)
+    first = list(seq.state_copy_src)
+    _run_step(bm, seq, 4)
+    second = list(seq.state_copy_src)
+    assert bm.linear_hash_to_block_id == {
+        bm.blocks[seq.block_table[0]].hash: first,
+        bm.blocks[seq.block_table[1]].hash: second,
+    }
+
+
+def test_step_ending_inside_a_chunk_leaves_no_snapshot(make_seq):
+    """状态只在一段 forward 结束时写出:跨过去的中间边界上没有状态可冻结。"""
+    bm = _linear_bm()
+    seq = make_seq(list(range(10)))
+    bm.allocate_prefill(seq, 0, None)
+    _run_step(bm, seq, 10)
+    assert bm.linear_hash_to_block_id == {} and bm.linear_state_cached == 0
+    assert seq.state_copy_src is None
+    assert len(bm.hash_to_block_id) == 2        # KV 整块照常登记
+
+
+def test_repeated_prompt_resumes_on_the_chunk_boundary(make_seq):
+    """命中长度 = KV 整块命中、且边界状态也命中的最长前缀;尾部不满一个 chunk 的部分不复用。"""
+    bm = _linear_bm()
+    tokens = list(range(10))                    # 2 个整块 + 2 个尾 token
+    seq1 = make_seq(tokens)
     bm.allocate_prefill(seq1, 0, None)
-    tail_id = seq1.block_table[0]
-    donor_state_cache_ids = list(seq1.state_cache_ids)
-
-    # 第一段 prefill 停在快照边界前,bundle 记录 parent=-1、partial=[1,2,3]
-    _record_start_bundle(bm, seq1, 3)
-    (bundle,) = bm.linear_hash_table[-1]
-    assert bundle.partial_token_ids == [1, 2, 3]
-    assert bundle.tail_block_id == tail_id
-    assert bm.blocks[tail_id].bundle is bundle
-    assert bm.search_linear_states(-1, make_seq(tokens1), 0) is bundle
-
-    # 第二段跑完整个 prefill 并结束,块全部释放但 bundle 惰性保留
-    seq1.num_scheduled_tokens = len(tokens1) - seq1.num_cached_tokens
-    bm.hash_blocks(seq1)
-    seq1.num_cached_tokens += seq1.num_scheduled_tokens
+    for n in (4, 4, 2):                         # 按 chunk 边界分三段算完
+        _run_step(bm, seq1, n)
+    kv_ids = list(seq1.block_table)
+    snapshots = [bm.linear_hash_to_block_id[bm.blocks[b].hash] for b in kv_ids[:2]]   # 尾块没有哈希
     bm.deallocate(seq1)
-    assert seq1.state_block_ids is None and seq1.state_cache_ids is None
-    assert bm.search_linear_states(-1, make_seq(tokens1), 0) is bundle
 
-    # 新请求共享 [1,2,3] 前缀:在第一块之前就命中 bundle
-    seq2 = make_seq(tokens1 + [10, 11])
-    cached, bundle = bm.can_allocate_prefill(seq2)
-    assert cached == 0 and bundle is not None
-    bm.allocate_prefill(seq2, cached, bundle)
-
-    # 命中即偷走:bundle 从表中摘除,新 seq 继承 state 块与部分尾块
-    assert bm.search_linear_states(-1, make_seq(tokens1), 0) is None
-    assert seq2.num_cached_tokens == 3          # partial 3 个 token 免算
-    assert seq2.pending_tail_copy is not None
-    assert seq2.pending_tail_copy[0] == tail_id
-    assert seq2.state_block_ids == donor_state_cache_ids
-    assert len(seq2.state_cache_ids) == 2
-
-    bm.deallocate(seq2)
-    assert len(bm.free_block_ids) == 23         # 全部归还(占位块除外)
+    seq2 = make_seq(tokens + [50, 51])          # 同前缀,多 2 个 token
+    assert bm.can_allocate_prefill(seq2) == (2, snapshots[1])
+    bm.allocate_prefill(seq2, 2, snapshots[1])
+    assert seq2.num_cached_tokens == 8          # 两个整 chunk;尾部的 2 个 token 不复用
+    assert seq2.block_table[:2] == kv_ids[:2]   # KV 块一并复用
+    assert seq2.state_copy_src == snapshots[1]  # 从 8 个 token 处的状态 copy 起步
+    assert not set(seq2.state_block_ids) & set(snapshots[1])
+    assert bm.prefix_cache_hit_tokens == 8
 
 
-def test_bundle_covering_whole_prompt_is_ignored(make_seq):
-    bm = BlockManager(num_blocks=24, block_size=TEST_BLOCK_SIZE,
-                      has_linear_attention=True, num_state_groups=2)
-    seq1 = make_seq([1, 2, 3, SNAP_TOKEN, 5, 6, 7, 8, 9])
+def test_partial_chunk_prefix_is_not_reusable(make_seq):
+    """共享的前缀只有 1 个整 chunk + 2 个 token:能续算的只有第 4 个 token 处的状态。"""
+    bm = _linear_bm()
+    seq1 = make_seq(list(range(6)))
     bm.allocate_prefill(seq1, 0, None)
-    _record_start_bundle(bm, seq1, 3)
+    for n in (4, 2):
+        _run_step(bm, seq1, n)
+    bm.deallocate(seq1)
 
-    # 新请求恰好只覆盖 partial:无需计算,bundle 被忽略,从头 prefill
-    seq2 = make_seq([1, 2, 3])
-    cached, bundle = bm.can_allocate_prefill(seq2)
-    assert cached == 0 and bundle is None
+    seq2 = make_seq(list(range(6)) + [40, 41, 42, 43])
+    cached, state_ids = bm.can_allocate_prefill(seq2)
+    assert cached == 1 and state_ids is not None
+    bm.allocate_prefill(seq2, cached, state_ids)
+    assert seq2.num_cached_tokens == 4          # [4, 5] 这 2 个 token 要重算
 
 
-def test_bundle_lazily_evicted_when_blocks_reused(make_seq):
-    bm = BlockManager(num_blocks=24, block_size=TEST_BLOCK_SIZE,
-                      has_linear_attention=True, num_state_groups=2)
-    seq1 = make_seq([1, 2, 3, SNAP_TOKEN, 5, 6, 7, 8, 9])
+def _cache_two_chunks(bm: BlockManager, make_seq):
+    """按 chunk 边界算完 [0..7] 并结束,留下 2 个 KV 块和 2 组边界状态快照。
+
+    返回 (各 KV 块 id, 各边界上的快照块)。
+    """
+    seq = make_seq(list(range(8)))
+    bm.allocate_prefill(seq, 0, None)
+    for _ in range(2):
+        _run_step(bm, seq, TEST_BLOCK_SIZE)
+    kv_ids = list(seq.block_table)
+    snapshots = [bm.linear_hash_to_block_id[bm.blocks[b].hash] for b in kv_ids]
+    bm.deallocate(seq)
+    return kv_ids, snapshots
+
+
+def test_state_miss_disables_kv_reuse(make_seq):
+    """前缀的线性状态算不出来,KV 块单独命中也没用:从头 prefill。"""
+    bm = _linear_bm(num_blocks=10)              # 9 个可用块
+    kv_ids, snapshots = _cache_two_chunks(bm, make_seq)
+    assert len(bm.hash_to_block_id) == 2 and len(snapshots) == 2
+
+    bm.linear_hash_to_block_id.clear()          # 等价于两组快照都已被逐出
+    assert bm.can_allocate_prefill(make_seq(list(range(8)) + [9])) == (0, None)
+
+
+def test_state_hit_falls_back_to_an_earlier_boundary(make_seq):
+    bm = _linear_bm(num_blocks=10)
+    kv_ids, snapshots = _cache_two_chunks(bm, make_seq)
+
+    # 较新的那组快照没了(等价于被逐出):退回到第一个边界
+    del bm.linear_hash_to_block_id[bm.blocks[kv_ids[1]].hash]
+    assert bm.can_allocate_prefill(make_seq(list(range(8)) + [9])) == (1, snapshots[0])
+
+
+def test_snapshot_hit_is_shared_not_stolen(make_seq):
+    """同前缀的请求可以先后/同时命中同一组快照:各自 copy 一份,登记一直在。"""
+    bm = _linear_bm()
+    kv_ids, snapshots = _cache_two_chunks(bm, make_seq)
+    seq_a = make_seq(list(range(8)) + [40])
+    seq_b = make_seq(list(range(8)) + [70, 71])
+    for seq in (seq_a, seq_b):
+        assert bm.can_allocate_prefill(seq) == (2, snapshots[1])
+        bm.allocate_prefill(seq, 2, snapshots[1])
+        assert seq.state_copy_src == snapshots[1]
+        assert not set(seq.state_block_ids) & set(snapshots[1])
+    assert all(bm.blocks[b].ref_count == 2 for b in snapshots[1])     # 被 a、b 同时持有
+    assert bm.linear_hash_to_block_id[bm.blocks[kv_ids[1]].hash] == snapshots[1]
+    assert bm.prefix_cache_hit_tokens == 16
+
+    _run_step(bm, seq_a, 1)                     # a 的 copy 发完
+    assert all(bm.blocks[b].ref_count == 1 for b in snapshots[1])
+    assert not set(snapshots[1]) & set(bm.free_block_ids)             # b 还在用
+    _run_step(bm, seq_b, 2)
+    assert all(b in bm.free_block_ids for b in snapshots[1])          # 都还给了缓存
+    assert bm.linear_hash_to_block_id[bm.blocks[kv_ids[1]].hash] == snapshots[1]
+
+
+def test_state_snapshot_lazily_evicted_when_its_pages_are_reused(make_seq):
+    bm = _linear_bm(num_blocks=10)
+    kv_ids, snapshots = _cache_two_chunks(bm, make_seq)
+    first = bm.blocks[kv_ids[0]].hash
+    second = bm.blocks[kv_ids[1]].hash
+
+    while first in bm.linear_hash_to_block_id:
+        bm.allocate_block()                     # 池子吃紧:从最久未用的页开始重新分配
+    # 只逐出了最老的那组;同组两页一起摘掉,降级成普通空闲页
+    assert bm.linear_hash_to_block_id == {second: snapshots[1]}
+    assert all(bm.blocks[b].hash == -1 for b in snapshots[0])
+    assert bm.hash_to_block_id == {first: kv_ids[0], second: kv_ids[1]}   # KV 条目没受影响
+
+
+def test_boundary_without_free_pages_leaves_no_snapshot(make_seq):
+    bm = BlockManager(num_blocks=9, block_size=TEST_BLOCK_SIZE,
+                      has_linear_attention=True, num_state_groups=2)   # 8 个可用块
+    seq = make_seq(list(range(12)))
+    other = make_seq([50, 51])
+    bm.allocate_prefill(seq, 0, None)           # 3 KV + 2 状态
+    bm.allocate_prefill(other, 0, None)         # 1 KV + 2 状态 → 池满
+    assert not bm.free_block_ids
+    working = list(seq.state_block_ids)
+
+    _run_step(bm, seq, 4)                       # 边界,但凑不出下一组新块
+    assert bm.linear_hash_to_block_id == {}
+    assert bm.linear_state_skipped == 1
+    assert seq.state_block_ids == working and seq.state_copy_src is None   # 原地继续
+
+    bm.deallocate(other)                        # 池里有页了,下一个边界照常冻结
+    _run_step(bm, seq, 4)
+    assert bm.linear_state_cached == 1 and seq.state_copy_src == working
+
+
+def test_boundary_already_cached_by_another_sequence_is_left_alone(make_seq):
+    bm = _linear_bm()
+    seq1 = make_seq(list(range(12)))
+    seq2 = make_seq(list(range(12)) + [99])
     bm.allocate_prefill(seq1, 0, None)
-    _record_start_bundle(bm, seq1, 3)
-    assert bm.search_linear_states(-1, make_seq([1, 2, 3, 4]), 0) is not None
+    bm.allocate_prefill(seq2, 0, None)          # 同前缀的另一条:各自从头算
+    _run_step(bm, seq1, 4)
+    _run_step(bm, seq2, 4)                      # 同一个边界:状态已经在表里
+    assert bm.linear_state_cached == 1
+    assert len(bm.linear_hash_to_block_id) == 1
+    assert seq2.state_copy_src is None          # 不重复冻结,也不用换块
+    assert seq2.state_block_ids != seq1.state_copy_src
 
-    bm.deallocate(seq1)                         # bundle 名下的块回到 free list
-    while bm.free_block_ids:                    # 池耗尽:逐出所有残留 bundle
-        bm.allocate_block()
-    assert bm.search_linear_states(-1, make_seq([1, 2, 3, 4]), 0) is None
+
+def test_deallocate_releases_a_pending_copy_source(make_seq):
+    """刚冻结、copy 还没发时被抢占/结束:冻结的页和新换的页都要归还。"""
+    bm = _linear_bm()
+    seq = make_seq(list(range(12)))
+    bm.allocate_prefill(seq, 0, None)
+    _run_step(bm, seq, 4)
+    assert seq.state_copy_src is not None
+    bm.deallocate(seq)
+    assert seq.state_copy_src is None and seq.state_block_ids is None
+    assert all(bm.blocks[b].ref_count == 0 for b in range(23))
+    assert len(bm.free_block_ids) == 23         # 占位块除外全部归还
+    assert len(bm.linear_hash_to_block_id) == 1   # 快照留给缓存
+
+
+def test_finishing_on_a_boundary_keeps_the_snapshot_without_rotating(make_seq):
+    bm = _linear_bm()
+    seq = make_seq(list(range(8)))
+    bm.allocate_prefill(seq, 0, None)
+    _run_step(bm, seq, 4)
+    _run_step(bm, seq, 4, rotate=False)         # prompt 正好在边界上算完,这一步就收尾
+    assert bm.linear_hash_to_block_id[bm.blocks[seq.block_table[1]].hash] == seq.state_block_ids
+    assert seq.state_copy_src is None           # 不用再换块
+    bm.deallocate(seq)
+    assert len(bm.linear_hash_to_block_id) == 2
+    assert len(bm.free_block_ids) == 23

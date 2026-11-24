@@ -384,14 +384,8 @@ class ModelRunner:
             self.cache.log_summary()
 
     def prepare_prefill(self, seqs: list[Sequence]):
-        src_ids, dst_ids = [], []
-        for seq in seqs:
-            pending = seq.pending_tail_copy
-            seq.pending_tail_copy = None
-            if pending is not None:
-                src_ids.append(pending[0])
-                dst_ids.append(pending[1])
-        self.cache.copy_blocks(src_ids, dst_ids)
+        # 命中前缀快照、或刚跨过 chunk 边界的序列:先把冻结的状态 copy 进自己的可变块
+        self.cache.copy_linear_states(seqs)
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -401,7 +395,6 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         has_mm = any(seq.is_multimodal for seq in seqs)
-        states_store_flags = []
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
@@ -429,7 +422,6 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-            states_store_flags.append(seq.store_linear_states)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -440,13 +432,13 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        states_store_flags = torch.tensor(states_store_flags, dtype=torch.bool, pin_memory=True).cuda(non_blocking=True)
         linear_slot_ids = self.cache.prepare_linear_slot_ids(seqs)
-        linear_cache_slot_ids = self.cache.prepare_linear_cache_slot_ids(seqs)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, linear_slot_ids, linear_cache_slot_ids, states_store_flags)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, linear_slot_ids)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        # 刚跨过 chunk 边界的序列:冻结的快照 copy 进新块,再在新块上原地解码
+        self.cache.copy_linear_states(seqs)
         self.cache.check_linear_states(seqs)
         input_ids = []
         positions = []

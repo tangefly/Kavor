@@ -78,9 +78,7 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []   # 逻辑块到物理块的映射，逻辑号 i，物理号 self.block_table[i]
         self.state_block_ids: list[int] | None = None
-        self.state_cache_ids: list[int] | None = None
-        self.pending_tail_copy: tuple[int, int] | None = None   # bundle 命中时待拷贝的尾块 (src, dst)
-        self.store_linear_states = False
+        self.state_copy_src: list[int] | None = None
         
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -147,12 +145,12 @@ class Sequence:
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         mm_inputs = None if self.mm_inputs is None else self.mm_inputs.for_workers(prefill=self.is_prefill)
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm_inputs, self.state_block_ids, self.state_cache_ids, self.pending_tail_copy, self.store_linear_states, self.temperature)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, mm_inputs, self.state_block_ids, self.state_copy_src, self.temperature)
 
     def __setstate__(self, state):
         (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
-         self.block_table, last_state, mm_inputs, self.state_block_ids, self.state_cache_ids, 
-         self.pending_tail_copy, self.store_linear_states, self.temperature) = state
+         self.block_table, last_state, mm_inputs, self.state_block_ids, self.state_copy_src,
+         self.temperature) = state
         self.mm_inputs = mm_inputs
         self.stats = None       # 统计只在引擎侧收集,worker 副本不需要
         if isinstance(last_state, list):

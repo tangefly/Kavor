@@ -261,13 +261,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         assert ids is not None, "..."
         return ids[:, self.state_group]
 
-    def get_linear_cache_slot_ids(self):
-        ctx = get_context()
-        if ctx.linear_cache_slot_ids is None or ctx.states_store_flags is None:
-            return None, None          # warmup / profile
-        return (ctx.linear_cache_slot_ids[:, self.state_group].tolist(),
-                ctx.states_store_flags.tolist())
-
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         if get_context().is_prefill:
             return self.prefill(hidden_states)
@@ -380,14 +373,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=True,
         )
 
-        # 5) 状态落池(tensor 索引,无 host 同步);bundle 命中的额外存一份
+        # 5) 状态落池(tensor 索引,无 host 同步)。这块页之后由 BlockManager 决定去向:
+        #    跨过 chunk 边界就冻结成前缀快照,序列换新块接着算(见 CachePool.copy_linear_states)
         self.conv_pool[slots_t] = new_conv_states
         self.recurrent_pool[slots_t] = last_state
-        cache_ids = context.linear_cache_slot_ids
-        if cache_ids is not None:
-            flags = context.states_store_flags
-            self.conv_pool[cache_ids[:, self.state_group][flags]] = new_conv_states[flags]
-            self.recurrent_pool[cache_ids[:, self.state_group][flags]] = last_state[flags]
 
         return self._finalize(
             core_attn_out, z.view(1, total_tokens, -1, self.head_v_dim), 1, total_tokens)[0]
@@ -411,7 +400,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """FLA 缺失时的逐序列 eager 路径(慢,仅保底)。"""
         context = get_context()
         slot_ids = self.get_linear_slot_ids().tolist()
-        cache_slot_ids, store_flags = self.get_linear_cache_slot_ids()
         cu_seqlens_q = context.cu_seqlens_q.tolist()
         cu_seqlens_k = context.cu_seqlens_k.tolist()
         kernel_size = self.conv_kernel_size - 1
@@ -419,7 +407,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         for i, slot in enumerate(slot_ids):
             q_start, q_end = cu_seqlens_q[i], cu_seqlens_q[i + 1]
             seq_len = q_end - q_start
-            # 本段 query 之前已缓存的 token 数:prefix cache 命中(bundle)或切块续算。
+            # 本段 query 之前已缓存的 token 数:prefix cache 命中(chunk 边界上的状态快照)或切块续算。
             # 这些 token 的线性状态不在本段 hidden_states 里,从 slot 的状态块恢复。
             num_cached = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]) - seq_len
 
@@ -464,10 +452,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             self.conv_pool[slot] = conv_state[0]
             self.recurrent_pool[slot] = last_recurrent_state[0]
-            if store_flags is not None and store_flags[i]:
-                cache_slot = cache_slot_ids[i]
-                self.conv_pool[cache_slot] = conv_state[0]
-                self.recurrent_pool[cache_slot] = last_recurrent_state[0]
             outputs.append(self._finalize(core_attn_out, z, 1, seq_len)[0])
 
         return torch.cat(outputs, dim=0)

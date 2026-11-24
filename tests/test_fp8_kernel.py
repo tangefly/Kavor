@@ -13,10 +13,12 @@ from types import SimpleNamespace
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 
+from kavor.layers import fp8_flashinfer  # noqa: E402
 from kavor.layers.fp8_kernel import fp8_blockwise_linear  # noqa: E402
 from kavor.layers.fp8_utils import (  # noqa: E402
     per_token_group_quant_fp8, w8a8_block_fp8_linear, w8a8_block_fp8_matmul)
-from kavor.layers.quant import Fp8BlockLinearMethod, Fp8Config  # noqa: E402
+from kavor.layers.quant import (  # noqa: E402
+    W8A16_MAX_M, Fp8BlockLinearMethod, Fp8Config)
 
 DEV = "cuda"
 FP8 = torch.float8_e4m3fn
@@ -161,23 +163,98 @@ def test_fp8_linear_method_routing():
 
 
 def test_fp8_linear_method_auto_routing():
-    """auto:decode 小 M 走 w8a16,prefill 大 M 走 w8a8。"""
+    """auto:能走 FlashInfer 就全走;否则 decode 小 M 走 w8a16、prefill 大 M 走 w8a8。"""
     torch.manual_seed(0)
     N, K = 256, 384
     w = torch.randn(N, K, dtype=torch.bfloat16, device=DEV) / 16
     w_q, w_s = _quant_weight_blockwise(w)
     layer = SimpleNamespace(weight=w_q, weight_scale_inv=w_s)
     method = _make_method("auto")
+    use_fi = fp8_flashinfer.supports(
+        torch.empty(1, K, dtype=torch.bfloat16, device=DEV), w_q, w_s)
 
-    for M in (1, 16, 32):
+    for M in (1, 16, 32, 33, 64, 256):
         x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
-        torch.testing.assert_close(
-            method.apply(layer, x, None), fp8_blockwise_linear(x, w_q, w_s, None))
-    for M in (33, 64, 256):
-        x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
-        torch.testing.assert_close(
-            method.apply(layer, x, None),
-            w8a8_block_fp8_linear(x, w_q, w_s, (128, 128)))
+        if use_fi:
+            expected = fp8_flashinfer.flashinfer_block_fp8_linear(x, w_q, w_s)
+        elif M <= W8A16_MAX_M:
+            expected = fp8_blockwise_linear(x, w_q, w_s, None)
+        else:
+            expected = w8a8_block_fp8_linear(x, w_q, w_s, (128, 128))
+        torch.testing.assert_close(method.apply(layer, x, None), expected)
+
+
+def test_flashinfer_block_fp8_linear_matches_reference():
+    if not fp8_flashinfer.flashinfer_available():
+        pytest.skip("FlashInfer 不可用")
+    torch.manual_seed(0)
+    M, N, K = 128, 512, 512
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=DEV) / 16
+    w_q, w_s = _quant_weight_blockwise(w)
+    bias = torch.randn(N, dtype=torch.bfloat16, device=DEV) / 16
+
+    out = fp8_flashinfer.flashinfer_block_fp8_linear(x, w_q, w_s, bias)
+    ref = F.linear(x, _dequant_blockwise(w_q, w_s), bias)
+
+    assert out.shape == ref.shape and out.dtype == torch.bfloat16
+    _assert_quant_noise(out, ref)
+
+
+def test_flashinfer_block_fp8_linear_3d_input():
+    """[B, T, hidden] 进 FlashInfer 路径要能 reshape 回 3D。"""
+    if not fp8_flashinfer.flashinfer_available():
+        pytest.skip("FlashInfer 不可用")
+    torch.manual_seed(0)
+    B, T, N, K = 2, 17, 512, 512
+    x = torch.randn(B, T, K, dtype=torch.bfloat16, device=DEV)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=DEV) / 16
+    w_q, w_s = _quant_weight_blockwise(w)
+
+    out = fp8_flashinfer.flashinfer_block_fp8_linear(x, w_q, w_s)
+    assert out.shape == (B, T, N) and out.dtype == torch.bfloat16
+    _assert_quant_noise(out, F.linear(x, _dequant_blockwise(w_q, w_s)))
+
+
+def test_flashinfer_requires_fp32_scale():
+    """FlashInfer 要求 fp32 scale;bf16 scale 必须被判为不可用(回退 Triton)。"""
+    x = torch.empty(8, 512, dtype=torch.bfloat16, device=DEV)
+    w = torch.empty(512, 512, dtype=FP8, device=DEV)
+    s_bf16 = torch.empty(4, 4, dtype=torch.bfloat16, device=DEV)
+    assert not fp8_flashinfer.supports(x, w, s_bf16)
+
+
+def _no_flashinfer(monkeypatch):
+    """模拟"没装 flashinfer":让探测函数抛 ImportError,并清掉探测缓存。"""
+    def boom():
+        raise ImportError("no flashinfer")
+
+    monkeypatch.setattr(fp8_flashinfer, "_load_gemm", boom)
+    monkeypatch.setattr(fp8_flashinfer, "_checked", False)
+    monkeypatch.setattr(fp8_flashinfer, "_available", False)
+    monkeypatch.setattr(fp8_flashinfer, "_gemm", None)
+
+
+def test_flashinfer_import_failure_falls_back(monkeypatch):
+    """没装 flashinfer 时探测应返回 False,让 auto 回退到 Triton 路径。"""
+    _no_flashinfer(monkeypatch)
+    assert fp8_flashinfer.flashinfer_available() is False
+    assert not fp8_flashinfer.supports(
+        torch.empty(8, 512, dtype=torch.bfloat16, device=DEV),
+        torch.empty(512, 512, dtype=FP8, device=DEV),
+        torch.empty(4, 4, dtype=torch.float32, device=DEV))
+
+
+def test_flashinfer_mode_requires_availability(monkeypatch):
+    """fp8_mode='flashinfer' 但在没有 FlashInfer 的机器上加载要直接报错。"""
+    _no_flashinfer(monkeypatch)
+
+    class Layer(torch.nn.Module):
+        pass
+
+    with pytest.raises(AssertionError, match="FlashInfer 不可用"):
+        _make_method("flashinfer").create_weights(
+            Layer(), input_size=512, output_size=512, weight_loader=None)
 
 
 def test_fp8_config_from_config_parses_mode():

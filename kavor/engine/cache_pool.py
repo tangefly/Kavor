@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from kavor.engine.block_manager import resident_blocks_per_seq
 from kavor.engine.sequence import Sequence
 from kavor.utils.logger import logger
 
@@ -109,10 +110,11 @@ class CachePool:
         torch.cuda.empty_cache()
 
     def max_concurrent(self) -> int:
+        
         layout = self.layout
         assert layout is not None, "page pool has not been planned yet"
         usable = layout.num_blocks - (1 if layout.linear_modules else 0)   # 末块给 CUDA graph 占位
-        return max(1, usable // (1 + layout.num_state_groups))
+        return max(1, usable // resident_blocks_per_seq(1, layout.num_state_groups))
 
     @property
     def block_size(self) -> int:
@@ -140,7 +142,7 @@ class CachePool:
         return self.num_blocks - 1 if self.has_linear_attention else None
 
     def copy_blocks(self, src_ids: list[int], dst_ids: list[int]):
-        """整页 D2D 拷贝(所有层池): bundle 命中时把尾块里的前缀 KV 拷给 adopter 的新块。
+        """整页 D2D 拷贝(所有层池):目前只用于线性状态的交接(见 copy_linear_states)。
 
         与 forward 同一 stream, 由调用方保证在本步 forward 之前发射。
         """
@@ -180,30 +182,24 @@ class CachePool:
             rows.append(ids)
         return torch.tensor(rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
     
-    def prepare_linear_cache_slot_ids(self, seqs: list[Sequence]) -> torch.Tensor | None:
-        if self.linear_padding_slot is None:
-            return None
-        rows = []
+    def copy_linear_states(self, seqs: list[Sequence]):
+        """把每条序列待交接的线性状态 copy 进它自己的可变块,必须在该步 forward 之前调用。
+
+        序列跨过 chunk 边界或命中前缀快照时,BlockManager 把冻结的快照页记在
+        ``state_copy_src``、换一组新块到 ``state_block_ids``(此时是空的)。这里发整页
+        D2D 拷贝,并让新块接过旧块的状态账本,check_linear_states 的自检照常成立。
+        """
+        src_ids, dst_ids = [], []
         for seq in seqs:
-            ids = seq.state_cache_ids
-            if ids is None:
-                # Warmup builds fake sequences without the scheduler, so point them at the padding block
-                assert not seq.block_table, (
-                    f"Sequence {seq.seq_id} is about to run without state blocks: "
-                    "they are allocated during prefill scheduling")
-                rows.append([self.linear_padding_slot] * self.num_state_groups)
+            src = seq.state_copy_src
+            if src is None:
                 continue
-            assert len(ids) == self.num_state_groups, (
-                f"Sequence {seq.seq_id} has {len(ids)} state blocks, "
-                f"but the model needs {self.num_state_groups}")
-            assert all(0 <= i < self.linear_padding_slot for i in ids), (
-                f"State block ids out of range ({ids}): valid range is [0, {self.linear_padding_slot}); "
-                "the last block is reserved for CUDA graphs")
-            assert len(set(ids)) == len(ids), (
-                f"Duplicate state blocks in one sequence ({ids}): "
-                "block groups sharing a page would overwrite each other")
-            rows.append(ids)
-        return torch.tensor(rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            src_ids.extend(src)
+            dst_ids.extend(seq.state_block_ids)
+            for s, d in zip(src, seq.state_block_ids):
+                self.linear_state_len[d] = self.linear_state_len[s]
+        if src_ids:
+            self.copy_blocks(src_ids, dst_ids)
 
     def check_linear_states(self, seqs: list[Sequence]):
         """Self-check before decode: each sequence's state blocks should stop exactly at len(seq) - 1 tokens.

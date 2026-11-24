@@ -45,22 +45,20 @@ class Scheduler:
                 if remaining == 0:
                     break
                 if not seq.block_table:
-                    num_cached_blocks, bundle = self.block_manager.can_allocate_prefill(seq)
+                    num_cached_blocks, state_ids = self.block_manager.can_allocate_prefill(seq)
                     if num_cached_blocks == -1:
                         break
-                    if bundle and bundle.partial_token_ids:
-                        num_tokens = seq.num_tokens - (num_cached_blocks * self.block_size + len(bundle.partial_token_ids))
-                    else:
-                        num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+                    num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
                 else:
                     num_tokens = seq.num_tokens - seq.num_cached_tokens
                 if remaining < num_tokens and (scheduled_seqs or seq.is_multimodal):
                     break
                 if not seq.block_table:
-                    self.block_manager.allocate_prefill(seq, num_cached_blocks, bundle)
+                    self.block_manager.allocate_prefill(seq, num_cached_blocks, state_ids)
                     seq.stats.mark_prefill_start()
                     if self.block_manager.enable_prefix_cache:
                         seq.stats.record_prefix_cache(seq.num_cached_tokens)
+                # 每段 prefill 停在 chunk 边界上,线性状态才留得下可复用的快照
                 seq.num_scheduled_tokens = self.clamp_tokens(seq, num_tokens, remaining)
                 
                 num_batched_tokens += seq.num_scheduled_tokens
@@ -69,7 +67,7 @@ class Scheduler:
                     self.waiting.popleft()
                     self.running.append(seq)
                 elif seq.num_scheduled_tokens < remaining:
-                    self.waiting.rotate(-1)                         # 主动停在快照边界:让路,本步不再回访
+                    self.waiting.rotate(-1)                         # 主动停在 chunk 边界:让路,本步不再回访
                     skipped += 1
                 else:
                     pass                                            # 预算耗尽:留在队头,下步优先续算
@@ -108,7 +106,7 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:
-                num_cached_blocks, bundle = self.block_manager.can_allocate_prefill(seq)
+                num_cached_blocks, state_ids = self.block_manager.can_allocate_prefill(seq)
                 if num_cached_blocks == -1:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
@@ -117,7 +115,7 @@ class Scheduler:
             if remaining < num_tokens and (scheduled_seqs or seq.is_multimodal):
                 break
             if not seq.block_table:
-                self.block_manager.allocate_prefill(seq, num_cached_blocks, bundle)
+                self.block_manager.allocate_prefill(seq, num_cached_blocks, state_ids)
                 seq.stats.mark_prefill_start()
                 if self.block_manager.enable_prefix_cache:
                     seq.stats.record_prefix_cache(seq.num_cached_tokens)
@@ -160,31 +158,31 @@ class Scheduler:
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
+            self.block_manager.release_state_copy(seq)    # 这一步 forward 前该发的 copy 已经发过
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
-                if seq.store_linear_states:
-                    self.block_manager.record_linear_cached_blocks(seq)
+                # 停在 chunk 边界上:冻结快照、换新块(postprocess 里不在边界时是空操作)
+                self.block_manager.cache_linear_state(seq)
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            finished = ((not seq.ignore_eos and token_id == self.eos)
+                        or seq.num_completion_tokens == seq.max_tokens)
+            # 收尾的序列不用再换块:状态块留在边界上,只把快照登记下来
+            self.block_manager.cache_linear_state(seq, rotate=not finished)
+            if finished:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
-                
-                
+
+
     def clamp_tokens(self, seq: Sequence, num_tokens: int, remaining: int):
+        """把一段 prefill 截在 chunk 边界上。
+
+        线性状态只在一段 forward 结束时写出,所以只有停在 block_size 整倍数上的那段
+        才留得下可复用的快照(见 BlockManager.cache_linear_state):每段要么算到下一个
+        chunk 边界,要么算到 prompt 结尾。预算不够走到边界就先用完预算,下一段从块
+        中间起步、到边界再停。
         """
-            1. clamp scheduled tokens for linear states snapshot
-            2. it will cause more prefill stages for one sequence
-        """
-        snap_end_token_id = 248068  # specialize for Qwen3.5
-        if seq.token_ids[seq.num_cached_tokens] == snap_end_token_id:
-            return min(num_tokens, remaining)
-        elif snap_end_token_id not in seq.token_ids[seq.num_cached_tokens + 1:]:
-            return min(num_tokens, remaining)
-        else:
-            snap_end_token_pos = seq.token_ids.index(snap_end_token_id)
-            scheduled = min(snap_end_token_pos - seq.num_cached_tokens, num_tokens, remaining)
-            seq.store_linear_states = scheduled == snap_end_token_pos - seq.num_cached_tokens
-            return scheduled
+        to_boundary = self.block_size - seq.num_cached_tokens % self.block_size
+        return min(num_tokens, remaining, to_boundary)
