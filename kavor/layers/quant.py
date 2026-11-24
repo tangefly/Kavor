@@ -26,13 +26,20 @@ class UnquantizedLinearMethod:
         return F.linear(x, layer.weight, bias)
 
 
+# auto 模式下走 w8a16 的 M 上限。decode 小 M 是权重带宽受限:w8a16 省掉
+# 激活量化那次读写,且带 split-K 把 N-tile 铺满 SM(实测 M<=32 比 w8a8 快
+# 1.2~1.7x);M 变大后是算力受限,FP8×FP8 的 2x 吞吐胜出,回到 w8a8。
+W8A16_MAX_M = 32
+
+
 class Fp8BlockLinearMethod:
     """FP8 E4M3 权重 + blockwise scale;fp8_mode 决定激活侧走哪条计算路径。
 
     w8a8:激活动态量化(per-token per-128-group)后进 FP8×FP8 GEMM,
         kernel vendor 自 vllm(kavor/layers/fp8_utils.py);
-    w8a16:激活保持 bf16,kernel 内权重转 bf16(kavor/layers/fp8_kernel.py)。
-    两种 mode 共用同一份权重/scale 存储,只是 forward 分流。
+    w8a16:激活保持 bf16,kernel 内权重转 bf16(kavor/layers/fp8_kernel.py);
+    auto:按本次激活的 M 分流(decode 小 M 走 w8a16,prefill 大 M 走 w8a8)。
+    三种 mode 共用同一份权重/scale 存储,只是 forward 分流。
     """
 
     def __init__(self, quant_config):
@@ -59,6 +66,15 @@ class Fp8BlockLinearMethod:
         layer.register_parameter("weight_scale_inv", scale)
 
     def apply(self, layer, x, bias):
+        if self.fp8_mode == "auto":
+            # M 在 CUDA graph 捕获时是静态的,分流结果会随每个 bs 的图固化
+            M = x.numel() // x.shape[-1]
+            if M <= W8A16_MAX_M:
+                return fp8_blockwise_linear(
+                    x, layer.weight, layer.weight_scale_inv, bias)
+            return w8a8_block_fp8_linear(
+                x, layer.weight, layer.weight_scale_inv,
+                self.weight_block_size, bias)
         if self.fp8_mode == "w8a8":
             return w8a8_block_fp8_linear(
                 x, layer.weight, layer.weight_scale_inv,
@@ -73,8 +89,8 @@ class Fp8Config:
                  fp8_mode="w8a8", activation_scheme=None):
         self.weight_block_size = tuple(weight_block_size)
         self.modules_to_not_convert = list(modules_to_not_convert or [])
-        assert fp8_mode in ("w8a8", "w8a16"), (
-            f"fp8_mode 只支持 'w8a8' / 'w8a16',遇到 {fp8_mode!r}")
+        assert fp8_mode in ("w8a8", "w8a16", "auto"), (
+            f"fp8_mode 只支持 'w8a8' / 'w8a16' / 'auto',遇到 {fp8_mode!r}")
         self.fp8_mode = fp8_mode
         # checkpoint 侧声明的激活量化方案(dynamic);实际走哪条路由由
         # fp8_mode 决定,这里只留作记录/日志

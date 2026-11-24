@@ -246,6 +246,7 @@ def run(args: argparse.Namespace):
         mm_cache_size_gb=args.mm_cache_size_gb,
         enforce_eager=args.enforce_eager,
         trust_remote_code=args.trust_remote_code,
+        fp8_mode=getattr(args, "fp8_mode", "auto"),
     )
     app = build_app(args, engine)
     uvicorn.run(app, host=args.host, port=args.port)

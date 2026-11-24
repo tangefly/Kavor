@@ -21,6 +21,10 @@ except ImportError:
         torch_chunk_gated_delta_rule as chunk_gated_delta_rule
     )
     _HAS_FLA = False
+    from kavor.utils.logger import logger
+    logger.warning(
+        "未安装 flash-linear-attention,线性注意力 prefill 回退到纯 torch 实现"
+        "(慢 1.6x 左右):pip install 'flash-linear-attention[cuda]'")
 
 from kavor.layers.attention.gated_delta_rule import fused_recurrent_gdn_decode
 from kavor.layers.attention.causal_conv1d import (

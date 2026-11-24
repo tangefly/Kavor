@@ -26,10 +26,10 @@ class AutoModelForCausalLM:
     ):
         model_class = cls._get_model_class(hfconfig)
         # 量化配置挂到 config 上,模型构造时按模块路径(prefix)决定是否量化;
-        # fp8_mode 由引擎侧传入(w8a8 默认 / w8a16 切回权重侧量化路径)
+        # fp8_mode 由引擎侧传入(w8a8/w8a16 固定路径,或 auto 按 M 分流)
         hfconfig.quant_config = Fp8Config.from_config(
             getattr(hfconfig, "quantization_config", None),
-            fp8_mode=kwargs.get("fp8_mode", "w8a8"))
+            fp8_mode=kwargs.get("fp8_mode", "auto"))
         model = model_class(hfconfig)
         cls.load_weight(model, hfconfig.name_or_path, use_tqdm)
         return model

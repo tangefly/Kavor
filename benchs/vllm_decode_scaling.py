@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--max-num-seqs", type=int, default=512)
+    parser.add_argument("--max-num-seqs", type=int, default=256)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--disable-chunked-prefill", action="store_true",
                         help="关闭 chunked prefill,消除 prefill/decode 混步"

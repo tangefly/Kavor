@@ -160,6 +160,26 @@ def test_fp8_linear_method_routing():
     _assert_quant_noise(out16, ref)
 
 
+def test_fp8_linear_method_auto_routing():
+    """auto:decode 小 M 走 w8a16,prefill 大 M 走 w8a8。"""
+    torch.manual_seed(0)
+    N, K = 256, 384
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=DEV) / 16
+    w_q, w_s = _quant_weight_blockwise(w)
+    layer = SimpleNamespace(weight=w_q, weight_scale_inv=w_s)
+    method = _make_method("auto")
+
+    for M in (1, 16, 32):
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+        torch.testing.assert_close(
+            method.apply(layer, x, None), fp8_blockwise_linear(x, w_q, w_s, None))
+    for M in (33, 64, 256):
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=DEV)
+        torch.testing.assert_close(
+            method.apply(layer, x, None),
+            w8a8_block_fp8_linear(x, w_q, w_s, (128, 128)))
+
+
 def test_fp8_config_from_config_parses_mode():
     quant_config = {
         "quant_method": "fp8",
@@ -171,6 +191,7 @@ def test_fp8_config_from_config_parses_mode():
     assert cfg.fp8_mode == "w8a16"
     assert cfg.activation_scheme == "dynamic"
     assert cfg.weight_block_size == (128, 128)
+    assert Fp8Config.from_config(quant_config, fp8_mode="auto").fp8_mode == "auto"
 
     assert Fp8Config.from_config(None) is None          # 非量化模型
     with pytest.raises(AssertionError):

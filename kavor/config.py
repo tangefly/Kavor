@@ -35,13 +35,13 @@ class Config:
     rdzv_port: int = -1
     has_linear_attention: bool = False
     num_linear_state_groups: int = 0
-    fp8_mode: str = "w8a8"
+    fp8_mode: str = "auto"
 
     def __post_init__(self):
         if not os.path.isdir(self.model):
             raise RuntimeError(f"Model not found: {self.model}")
-        assert self.fp8_mode in ("w8a8", "w8a16"), (
-            f"fp8_mode 只支持 'w8a8' / 'w8a16',遇到 {self.fp8_mode!r}")
+        assert self.fp8_mode in ("w8a8", "w8a16", "auto"), (
+            f"fp8_mode 只支持 'w8a8' / 'w8a16' / 'auto',遇到 {self.fp8_mode!r}")
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.mm_cache_size_gb >= 0, "mm_cache_size_gb 不能为负"

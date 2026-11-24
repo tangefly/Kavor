@@ -25,6 +25,10 @@ def add_server_args(parser: argparse.ArgumentParser):
         help="允许加载 tokenizer 时执行模型目录里的自定义代码。模型 config 由 Kavor 自己解析,不受此开关影响")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument(
+        "--fp8-mode", default="auto", choices=("auto", "w8a8", "w8a16"),
+        help="FP8 模型的激活侧计算路径:auto=按 M 分流(decode 走 w8a16、"
+             "prefill 走 w8a8),w8a8/w8a16=固定路径")
+    parser.add_argument(
         "--mm-max-pixels", type=int, default=1280 * 28 * 28,
         help="多模态请求里每张图(视频为每帧)的像素上限,超了会等比缩小;"
              "不设上限时模型自己会用 16777216(打平正好 16384 个视觉 token,顶满 max-num-batched-tokens)")
