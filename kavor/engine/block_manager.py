@@ -130,8 +130,7 @@ class BlockManager:
                         break
             else:
                 num_cached_blocks = len(chain)
-            num_needed_blocks -= sum(1 for _, block_id in chain[:num_cached_blocks]
-                                     if block_id in self.used_block_ids)
+            num_needed_blocks -= sum(1 for _, block_id in chain[:num_cached_blocks] if block_id in self.used_block_ids)
         num_needed_blocks = resident_blocks_per_seq(num_needed_blocks, self.num_state_groups)
         # lack of enough blocks for prefill
         if len(self.free_block_ids) < num_needed_blocks:

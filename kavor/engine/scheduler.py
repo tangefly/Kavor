@@ -13,6 +13,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
+        self.snapshot_decode_states = getattr(config, "snapshot_decode_states", False)
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, config.kvcache_block_size,
             has_linear_attention=config.has_linear_attention,
@@ -168,8 +169,8 @@ class Scheduler:
             seq.append_token(token_id)
             finished = ((not seq.ignore_eos and token_id == self.eos)
                         or seq.num_completion_tokens == seq.max_tokens)
-            # 收尾的序列不用再换块:状态块留在边界上,只把快照登记下来
-            self.block_manager.cache_linear_state(seq, rotate=not finished)
+            if is_prefill or self.snapshot_decode_states:
+                self.block_manager.cache_linear_state(seq, rotate=not finished)
             if finished:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
@@ -177,12 +178,11 @@ class Scheduler:
 
 
     def clamp_tokens(self, seq: Sequence, num_tokens: int, remaining: int):
-        """把一段 prefill 截在 chunk 边界上。
-
-        线性状态只在一段 forward 结束时写出,所以只有停在 block_size 整倍数上的那段
-        才留得下可复用的快照(见 BlockManager.cache_linear_state):每段要么算到下一个
-        chunk 边界,要么算到 prompt 结尾。预算不够走到边界就先用完预算,下一段从块
-        中间起步、到边界再停。
-        """
-        to_boundary = self.block_size - seq.num_cached_tokens % self.block_size
-        return min(num_tokens, remaining, to_boundary)
+        """把一段 prefill 截在最后一个完整 block 的边界上。"""
+        budget = min(num_tokens, remaining)
+        end = seq.num_cached_tokens + budget
+        aligned_end = end - end % self.block_size
+        if aligned_end <= seq.num_cached_tokens:
+            # 这一段跨不过任何 block 边界(prompt 尾巴,或预算不到边界):直接算完
+            return budget
+        return aligned_end - seq.num_cached_tokens

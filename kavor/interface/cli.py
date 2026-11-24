@@ -21,6 +21,11 @@ def add_server_args(parser: argparse.ArgumentParser):
         help="mm embedding 缓存池大小(GiB),在 KV 池之前预留;0 表示不占显存")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
+        "--snapshot-decode-states", action="store_true",
+        help="decode 阶段也冻结线性注意力状态快照(默认关)。只在生成内容会被后续请求"
+             "原样复用时才有收益(非 thinking 模式、agent 回灌完整输出);"
+             "think 模型剥掉历史推理内容时开了也命中不到")
+    parser.add_argument(
         "--trust-remote-code", action="store_true",
         help="允许加载 tokenizer 时执行模型目录里的自定义代码。模型 config 由 Kavor 自己解析,不受此开关影响")
     parser.add_argument("--temperature", type=float, default=0.2)

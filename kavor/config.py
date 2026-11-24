@@ -35,6 +35,7 @@ class Config:
     rdzv_port: int = -1
     has_linear_attention: bool = False
     num_linear_state_groups: int = 0
+    snapshot_decode_states: bool = False
     fp8_mode: str = "auto"
 
     def __post_init__(self):

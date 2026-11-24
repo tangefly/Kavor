@@ -57,6 +57,7 @@ def make_config():
             num_kvcache_blocks=64,
             has_linear_attention=False,
             num_linear_state_groups=0,
+            snapshot_decode_states=False,
         )
         values.update(overrides)
         return SimpleNamespace(**values)

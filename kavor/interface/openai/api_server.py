@@ -247,6 +247,7 @@ def run(args: argparse.Namespace):
         enforce_eager=args.enforce_eager,
         trust_remote_code=args.trust_remote_code,
         fp8_mode=getattr(args, "fp8_mode", "auto"),
+        snapshot_decode_states=getattr(args, "snapshot_decode_states", False),
     )
     app = build_app(args, engine)
     uvicorn.run(app, host=args.host, port=args.port)

@@ -213,16 +213,36 @@ def test_linear_full_prefill_and_state_blocks(make_seq, make_config):
     assert len(sched.block_manager.free_block_ids) == 31   # 占位块除外全部归还
 
 
-def test_linear_prefill_stops_on_chunk_boundaries(make_seq, make_config):
-    """每段 prefill 停在 block_size 的整倍数上:线性状态只有在 chunk 边界才留得下快照。"""
+def test_linear_prefill_stops_at_the_last_complete_block(make_seq, make_config):
+    """段尾对齐到最后一个完整 block;段内跨过的边界不单独切段,也不留快照。"""
     sched = linear_scheduler(make_config)
     bm = sched.block_manager
     seq = make_seq(list(range(9)), max_tokens=1)
     sched.add(seq)
 
-    assert prefill(sched, seq) == [4, 4, 1]      # 两个整 chunk + prompt 结尾
+    assert prefill(sched, seq) == [8, 1]         # 一个整段到最后一个完整块 + prompt 尾巴
     assert seq.is_finished
-    assert len(bm.linear_hash_to_block_id) == 2  # 4 和 8 两处都留下了快照
+    assert len(bm.linear_hash_to_block_id) == 1  # 只有 8 这一处快照
+    assert len(bm.free_block_ids) == 63
+
+
+def test_linear_prefill_snapshots_only_at_segment_ends(make_seq, make_config):
+    """预算把一个 prompt 切成多段时,每段只留段尾一处快照,段内边界不产生快照。"""
+    sched = linear_scheduler(make_config, max_num_batched_tokens=16)
+    bm = sched.block_manager
+    seq = make_seq(list(range(24)), max_tokens=1)
+    sched.add(seq)
+
+    batch, is_prefill = sched.schedule()
+    assert is_prefill and batch == [seq]
+    assert seq.num_scheduled_tokens == 16
+    sched.postprocess(batch, [5], True)
+    # 只有 16 处(第 4 个 KV 块)登记了快照;4/8/12 处没有
+    assert list(bm.linear_hash_to_block_id) == [bm.blocks[seq.block_table[3]].hash]
+
+    assert prefill(sched, seq) == [8]
+    assert seq.is_finished
+    assert len(bm.linear_hash_to_block_id) == 2  # 16 和 24 两处段尾
     assert len(bm.free_block_ids) == 63
 
 
@@ -251,7 +271,7 @@ def test_repeated_prompt_resumes_from_the_last_chunk_boundary(make_seq, make_con
     seq1 = make_seq(tokens, max_tokens=1)
     sched.add(seq1)
     assert drive(sched) and seq1.is_finished
-    assert len(bm.linear_hash_to_block_id) == 3  # 4、8、12 三个边界
+    assert len(bm.linear_hash_to_block_id) == 1  # 只留 prompt 最后一个完整块(12)处的快照
 
     seq2 = make_seq(tokens + [50, 51], max_tokens=1)   # 同前缀,多 2 个 token
     sched.add(seq2)
@@ -266,8 +286,9 @@ def test_repeated_prompt_resumes_from_the_last_chunk_boundary(make_seq, make_con
 
 
 def test_decode_boundary_freezes_state_and_swaps_in_a_new_block(make_seq, make_config):
-    """decode 原地更新状态块;走到 chunk 边界时冻结 + 换块,下一步 forward 前 copy。"""
-    sched = linear_scheduler(make_config)
+    """打开 snapshot_decode_states 时:decode 原地更新状态块;走到 chunk 边界时冻结 + 换块,
+    下一步 forward 前 copy。"""
+    sched = linear_scheduler(make_config, snapshot_decode_states=True)
     bm = sched.block_manager
     seq = make_seq(list(range(5)), max_tokens=8)   # 5 + 8 = 13 个 token,decode 跨过 8 和 12
     sched.add(seq)
@@ -303,9 +324,9 @@ def test_next_turn_hits_the_state_frozen_during_decode(make_seq, make_config):
     """多轮对话:上一轮在 decode 阶段跨过 chunk 边界,下一轮的 prompt 就能从这里续算。
 
     上一轮的 prompt 不足一个 chunk,prefill 阶段只留得下 4 这一处快照;8 这一处全靠
-    decode 跨边界时冻结。
+    decode 跨边界时冻结(需要 snapshot_decode_states=True)。
     """
-    sched = linear_scheduler(make_config)
+    sched = linear_scheduler(make_config, snapshot_decode_states=True)
     seq1 = make_seq(list(range(5)), max_tokens=4)   # 5 + 4 = 9 个 token,decode 跨过 8
     sched.add(seq1)
     assert drive(sched) and seq1.is_finished
@@ -321,13 +342,35 @@ def test_next_turn_hits_the_state_frozen_during_decode(make_seq, make_config):
     assert drive(sched) and seq2.is_finished
 
 
+def test_decode_does_not_snapshot_states_by_default(make_seq, make_config):
+    """默认关:decode 跨过 block 边界也不冻结快照、不换块,只保留 prefill 段尾那处快照。"""
+    sched = linear_scheduler(make_config)          # snapshot_decode_states 默认 False
+    bm = sched.block_manager
+    seq = make_seq(list(range(5)), max_tokens=8)
+    sched.add(seq)
+    assert prefill(sched, seq) == [4, 1]
+    working = list(seq.state_block_ids)
+    assert len(bm.linear_hash_to_block_id) == 1    # 只有 prefill 的 4 处
+
+    while seq.num_tokens - 1 < 8:                  # 让 decode 跨过 8 这个边界
+        batch, is_prefill = sched.schedule()
+        assert not is_prefill and batch == [seq]
+        sched.postprocess(batch, [5], False)
+    assert seq.state_copy_src is None              # 没有冻结,也没有换块
+    assert seq.state_block_ids == working
+    assert len(bm.linear_hash_to_block_id) == 1    # decode 没有新增快照
+
+    assert drive(sched) and seq.is_finished
+    assert len(bm.free_block_ids) == 63
+
+
 def test_preempt_with_a_pending_copy_frees_every_block(make_seq, make_config):
     """刚冻结、copy 还没发时被抢占:冻结的页留给缓存,其余全部归还,重新准入时照常命中。"""
     sched = linear_scheduler(make_config, num_kvcache_blocks=10)   # 9 个可用块
     bm = sched.block_manager
     seq = make_seq(list(range(8)), max_tokens=6)
     sched.add(seq)
-    assert prefill(sched, seq) == [4, 4]          # prompt 正好在边界上算完
+    assert prefill(sched, seq) == [8]             # prompt 正好在边界上,一段算完
     snapshot = list(seq.state_copy_src)           # 8 处的快照;copy 要到下一步 decode 的 forward 前才发
     assert snapshot is not None
     assert len(bm.free_block_ids) == 3            # 2 KV + 2 状态 + 2 待 copy 的快照
@@ -339,7 +382,7 @@ def test_preempt_with_a_pending_copy_frees_every_block(make_seq, make_config):
     assert seq.block_table == []
     assert all(bm.blocks[b].ref_count == 0 for b in range(9))
     assert len(bm.free_block_ids) == 9
-    assert len(bm.linear_hash_to_block_id) == 2   # 两组快照都留给缓存
+    assert len(bm.linear_hash_to_block_id) == 1   # 快照留给缓存
 
     # 重新准入:它已经有 9 个 token,前两个整块的 KV 和 8 处的状态快照都还在缓存里,
     # 从 8 个 token 处续算(刚生成的那个 token 还没进 KV,本来就要重算)
@@ -378,7 +421,7 @@ def test_full_pool_skips_the_snapshot_but_sequences_still_finish(make_seq, make_
 
     assert drive(sched)
     assert seq.is_finished and seq.num_tokens == 16
-    assert bm.linear_state_skipped == 3           # 4、8、12 三处边界都没留下快照
+    assert bm.linear_state_skipped == 1           # 唯一一次段尾(12 处)没留下快照
     assert bm.linear_hash_to_block_id == {}
     assert len(bm.free_block_ids) == 6
 
@@ -386,13 +429,17 @@ def test_full_pool_skips_the_snapshot_but_sequences_still_finish(make_seq, make_
 def test_clamp_tokens_unit(make_seq, make_config):
     sched = linear_scheduler(make_config)
 
-    # 从块中间起步:截到下一个 chunk 边界
+    # 从块中间起步:截到下一个边界
     seq = make_seq([9, 8, 7, 6, 5, 4])
     seq.num_cached_tokens = 1
     assert sched.clamp_tokens(seq, 5, 10) == 3
-    # 正好在边界上,剩余不止一个 chunk:一次一个 chunk
+    # 预算内尽量多算,只把段尾对齐到最后一个完整 block
     seq.num_cached_tokens = 4
-    assert sched.clamp_tokens(seq, 9, 10) == 4
+    assert sched.clamp_tokens(seq, 9, 10) == 8
+    # prompt 正好在边界上结束:一段算完
+    seq.num_cached_tokens = 0
+    assert sched.clamp_tokens(seq, 8, 10) == 8
     # prompt 在边界内结束 / 预算不够走到边界:取更短的那个
+    seq.num_cached_tokens = 4
     assert sched.clamp_tokens(seq, 2, 10) == 2
     assert sched.clamp_tokens(seq, 9, 1) == 1
