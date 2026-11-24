@@ -1,4 +1,4 @@
-"""JIT 编译 vendored 的 Marlin CUDA 扩展(kavor/csrc/marlin)。
+"""JIT 编译 vendored 的 Marlin CUDA 扩展(kavor/csrc/quantization/marlin)。
 
 首次调用 ``load_marlin()`` 会编译并加载 ``torch.ops.kavor_marlin``;之后进程内
 直接复用。产物按「源码 hash + torch/CUDA 版本 + 设备 CC」命名,缓存在 torch
@@ -23,7 +23,7 @@ import torch
 
 from kavor.utils.logger import logger
 
-CSRC = Path(__file__).resolve().parents[2] / "csrc" / "marlin"
+CSRC = Path(__file__).resolve().parents[2] / "csrc" / "quantization" / "marlin"
 _EXT_PREFIX = "kavor_marlin"
 
 _ops = None
@@ -35,11 +35,11 @@ def is_disabled() -> bool:
 
 
 def _sources() -> list[str]:
-    generated = sorted((CSRC / "generated").glob("sm80_kernel_*.cu"))
+    generated = sorted(CSRC.glob("*kernel_*.cu"))
     if not generated:
         raise RuntimeError(
-            f"{CSRC / 'generated'} 下没有 sm80_kernel_*.cu,"
-            "请先运行 python csrc/marlin/generate_kernels.py 8.0")
+            f"{CSRC} 下没有 *kernel_*.cu,"
+            "请先运行 python csrc/quantization/marlin/generate_kernels.py 8.0")
     return [
         str(CSRC / "marlin.cu"),
         str(CSRC / "gptq_marlin_repack.cu"),
@@ -95,7 +95,7 @@ def _build() -> None:
         "-O3",
         "--use_fast_math",
         "-std=c++17",
-        # Marlin 的 kernel 实例化在 generated/*.cu 里,主 TU 只引用符号;
+        # Marlin 的 kernel 实例化在 generate_kernels.py 生成的 *.cu 里,主 TU 只引用符号;
         # nvcc 12+ 默认把模板 stub 设为 static,跨 TU 链接会失败。
         "-static-global-template-stub=false",
         *_arch_flags(),
@@ -108,7 +108,7 @@ def _build() -> None:
             load(
                 name=name,
                 sources=_sources(),
-                extra_include_paths=[str(CSRC), str(CSRC / "generated")],
+                extra_include_paths=[str(CSRC)],
                 extra_cuda_cflags=cuda_flags,
                 extra_cflags=["-O3", "-std=c++17"],
                 is_python_module=False,

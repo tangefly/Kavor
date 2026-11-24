@@ -4,7 +4,7 @@
 # Vendored from vLLM csrc/libtorch_stable/quantization/marlin/generate_kernels.py
 # and trimmed to the FP8 weight-only (W8A16) subset used by Kavor.
 # Regenerate with:  python generate_kernels.py 8.0
-# (writes into ./generated/; the generated files are committed).
+# (writes next to this script, same as upstream; the generated files are committed).
 import glob
 import itertools
 import os
@@ -12,8 +12,6 @@ import subprocess
 import sys
 
 import jinja2
-
-OUT_DIR = os.path.join(os.path.dirname(__file__), "generated")
 
 ARCHS = []
 SUPPORT_FP8 = False
@@ -81,10 +79,10 @@ QUANT_CONFIGS = [
 
 
 def remove_old_kernels():
-    for filename in glob.glob(OUT_DIR + "/*kernel_*.cu"):
+    for filename in glob.glob(os.path.dirname(__file__) + "/*kernel_*.cu"):
         subprocess.call(["rm", "-f", filename])
 
-    filename = OUT_DIR + "/kernel_selector.h"
+    filename = os.path.dirname(__file__) + "/kernel_selector.h"
     subprocess.call(["rm", "-f", filename])
 
 
@@ -215,7 +213,7 @@ def generate_new_kernels():
 
             filename = filename.lower()
 
-            with open(os.path.join(OUT_DIR, filename), "w") as f:
+            with open(os.path.join(os.path.dirname(__file__), filename), "w") as f:
                 f.write(file_content)
 
     if not SUPPORT_FP8 and kernel_selector_str != FILE_HEAD_COMMENT:
@@ -225,7 +223,7 @@ def generate_new_kernels():
             '"marlin kernel with fp8 activation is not built.");'
         )
 
-    with open(os.path.join(OUT_DIR, "kernel_selector.h"), "w") as f:
+    with open(os.path.join(os.path.dirname(__file__), "kernel_selector.h"), "w") as f:
         f.write(kernel_selector_str)
 
 

@@ -32,7 +32,7 @@ TORCH_VARIANTS = {
         "wheel": "torch-2.9.1%2Bcu130-{py}-{py}-manylinux_2_28_x86_64.whl",
         "driver_cuda_min": 13,
         "flash_attn_version": "2.8.3.post2",
-        "flash_attn_local": "cu130torch2.9cxx11abitrue",
+        "flash_attn_local": "cu13torch2.9cxx11abitrue",
     },
 }
 DEFAULT_VARIANT = "cu130"
@@ -51,8 +51,47 @@ _PROBE = (
     "'cuda': torch.version.cuda,"
     "'abi': bool(torch._C._GLIBCXX_USE_CXX11_ABI)}))"
 )
+_FLASH_ATTN_PROBE = (
+    "import json\n"
+    "try:\n"
+    "    import flash_attn\n"
+    "except Exception as exc:\n"
+    "    print(json.dumps({'error': type(exc).__name__}))\n"
+    "else:\n"
+    "    print(json.dumps({'version': flash_attn.__version__}))\n"
+)
 
 _probe_cache = None
+_probe_python = None
+_flash_attn_probe_cache = None
+
+
+def _run_probe(python, code):
+    """借目标环境的解释器跑一段探测脚本,返回最后一行 JSON;失败返回 None。"""
+    try:
+        # pip 的构建隔离会把 PYTHONPATH 指向它自己的 site 目录,
+        # 那里的 sitecustomize.py 会把目标环境的 site-packages 从
+        # sys.path 里删掉。这里必须清掉,否则连目标环境的 torch 也 import 不到。
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("PYTHONPATH", "PYTHONHOME")
+        }
+        done = subprocess.run(
+            [python, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+    except Exception:
+        return None
+    if done.returncode != 0 or not done.stdout.strip():
+        return None
+    try:
+        return json.loads(done.stdout.strip().splitlines()[-1])
+    except ValueError:
+        return None
 
 
 def probe_target_torch():
@@ -62,7 +101,7 @@ def probe_target_torch():
     但 CONDA_PREFIX / VIRTUAL_ENV 会原样传进来,所以借目标环境的解释器
     跑一次探测最准,也不用往构建依赖里塞一整个 torch。
     """
-    global _probe_cache
+    global _probe_cache, _probe_python
     if _probe_cache is not None:
         return _probe_cache
 
@@ -72,6 +111,7 @@ def probe_target_torch():
     except ImportError:
         pass
     else:
+        _probe_python = sys.executable
         _probe_cache = {
             "version": torch.__version__,
             "cuda": torch.version.cuda,
@@ -86,33 +126,34 @@ def probe_target_torch():
         python = os.path.join(prefix, "bin", "python")
         if not os.path.exists(python):
             continue
-        try:
-            # pip 的构建隔离会把 PYTHONPATH 指向它自己的 site 目录,
-            # 那里的 sitecustomize.py 会把目标环境的 site-packages 从
-            # sys.path 里删掉。这里必须清掉,否则连目标环境的 torch 也 import 不到。
-            env = {
-                k: v
-                for k, v in os.environ.items()
-                if k not in ("PYTHONPATH", "PYTHONHOME")
-            }
-            done = subprocess.run(
-                [python, "-c", _PROBE],
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env=env,
-            )
-        except Exception:
+        result = _run_probe(python, _PROBE)
+        if result is None:
             continue
-        if done.returncode != 0 or not done.stdout.strip():
-            continue
-        try:
-            _probe_cache = json.loads(done.stdout.strip().splitlines()[-1])
-        except ValueError:
-            continue
+        _probe_python = python
+        _probe_cache = result
         return _probe_cache
 
     return None
+
+
+def probe_local_flash_attn():
+    """目标环境里已装且能 import 的 flash-attn 版本,没有返回 None。
+
+    只认能 import 的:装了个 ABI 不匹配的 .so 时 import 会失败,
+    这种情况要继续走预编译 wheel 重装。
+    """
+    global _flash_attn_probe_cache
+    if _flash_attn_probe_cache is not None:
+        return _flash_attn_probe_cache
+
+    if _probe_python is None:
+        return None
+
+    result = _run_probe(_probe_python, _FLASH_ATTN_PROBE)
+    if not result or result.get("error") or not result.get("version"):
+        return None
+    _flash_attn_probe_cache = result["version"]
+    return _flash_attn_probe_cache
 
 
 def detect_nvcc_cuda():
@@ -299,6 +340,23 @@ def get_requirements():
     if mode == "build":
         print("[kavor] KAVOR_FLASH_ATTN=build,走源码编译")
         req.append("flash-attn")
+    elif mode == "wheel":
+        if wheel is not None:
+            print(
+                "[kavor] KAVOR_FLASH_ATTN=wheel,"
+                f"使用预编译 wheel: {wheel.split(' @ ')[1]}"
+            )
+            req.append(wheel)
+        else:
+            print("[kavor] KAVOR_FLASH_ATTN=wheel,但没有匹配到预编译 wheel。")
+    elif (local := probe_local_flash_attn()) is not None:
+        print(f"[kavor] 目标环境已有 flash-attn {local},跳过预编译 wheel 下载")
+        if local.split("+")[0] != FLASH_ATTN_VERSION:
+            print(
+                f"        预编译 wheel 的版本是 {FLASH_ATTN_VERSION},"
+                "如需换成它请设 KAVOR_FLASH_ATTN=wheel"
+            )
+        req.append("flash-attn")
     elif wheel is not None:
         print(f"[kavor] flash-attn 使用预编译 wheel: {wheel.split(' @ ')[1]}")
         req.append(wheel)
@@ -315,14 +373,13 @@ setup(
     # 所以要在这里显式声明为 kavor 包的 data files。
     package_data={
         "kavor": [
-            "csrc/marlin/*.cu",
-            "csrc/marlin/*.cuh",
-            "csrc/marlin/*.h",
-            "csrc/marlin/*.py",
-            "csrc/marlin/*.md",
-            "csrc/marlin/LICENSE.vllm",
-            "csrc/marlin/NOTICE",
-            "csrc/marlin/generated/*",
+            "csrc/quantization/marlin/*.cu",
+            "csrc/quantization/marlin/*.cuh",
+            "csrc/quantization/marlin/*.h",
+            "csrc/quantization/marlin/*.py",
+            "csrc/quantization/marlin/*.md",
+            "csrc/quantization/marlin/LICENSE.vllm",
+            "csrc/quantization/marlin/NOTICE",
         ],
     },
 )
