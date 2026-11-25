@@ -38,7 +38,7 @@ class ModelRunner:
         torch.set_default_device("cuda")
         Sequence.block_size = config.kvcache_block_size
         self.model = AutoModelForCausalLM.from_pretrained(
-            hf_config, use_tqdm=self.enable_log, fp8_backend=config.fp8_backend)
+            hf_config, use_tqdm=self.enable_log)
         self.sampler = Sampler()
         self.mm_cache = None
         self.allocate_kv_cache()

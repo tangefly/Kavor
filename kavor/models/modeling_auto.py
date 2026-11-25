@@ -27,10 +27,9 @@ class AutoModelForCausalLM:
     ):
         model_class = cls._get_model_class(hfconfig)
         # 量化配置挂到 config 上,模型构造时按模块路径(prefix)决定是否量化;
-        # fp8_backend 由引擎侧传入;auto 时按 registry 的优先级选择
+        # 具体 kernel 由 registry 在加载期从可用后端里自动选最优的
         hfconfig.quant_config = Fp8Config.from_config(
-            getattr(hfconfig, "quantization_config", None),
-            fp8_backend=kwargs.get("fp8_backend", "auto"))
+            getattr(hfconfig, "quantization_config", None))
         model = model_class(hfconfig)
         cls.load_weight(model, hfconfig.name_or_path, use_tqdm)
         cls._prepare_quantized_layers(model)

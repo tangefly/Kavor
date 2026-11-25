@@ -7,7 +7,7 @@ class GenerateRequest(BaseModel):
     prompt: str
     model: str | None = None        # 可选:带了就校验,和 /v1/chat/completions 一致
     max_tokens: int = 512
-    temperature: float = 1.0
+    temperature: float = Field(default=0.0, ge=0)
     ignore_eos: bool = False
     stream: bool = False
     request_id: str | None = None

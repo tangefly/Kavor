@@ -53,14 +53,11 @@ def real_block_size(small_block_size, llm, monkeypatch):
 def greedy(max_tokens: int):
     """逐 token 对比需要确定性解码:同一个输入每次必须给出同一个 token。
 
-    采样 kernel 对 temperature == 0 走 argmax(平局取最小下标),但 SamplingParams 不放开
-    greedy;这里只为了对比,绕过那道检查。
+    temperature == 0 走 argmax(平局取最小下标),输出与输入严格一一对应。
     """
     from kavor import SamplingParams
 
-    params = SamplingParams(temperature=1.0, max_tokens=max_tokens, ignore_eos=True)
-    params.temperature = 0.0
-    return params
+    return SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=True)
 
 
 def linear_only(llm):

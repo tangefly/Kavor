@@ -192,7 +192,7 @@ def select_kernel(cfg: Fp8LinearConfig, backend: str, prefix: str = "") -> Fp8Ke
     if backend == "auto":
         raise RuntimeError(
             "没有可用的 FP8 kernel。\n  " + detail +
-            "\n可用 --fp8-backend 指定,或用 KAVOR_DISABLED_KERNELS 排除问题 kernel。")
+            "\n可以用 KAVOR_DISABLED_KERNELS 排除有问题的 kernel 后重试。")
     raise RuntimeError(
         f"fp8_backend={backend!r} 不可用:\n  " + detail +
-        "\n可改回 --fp8-backend auto 让 Kavor 自动选择。")
+        "\n只有测试/调试才会指定具体 backend,正常推理请用 'auto' 让 Kavor 自动选择。")

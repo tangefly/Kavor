@@ -48,8 +48,7 @@ def model_not_found(requested: str, served: str) -> APIError:
 def to_sampling_params(req: ChatCompletionRequest | GenerateRequest, args: argparse.Namespace) -> SamplingParams:
     max_tokens = req.max_tokens or getattr(req, "max_completion_tokens", None) or args.max_model_len
     temperature = args.temperature if req.temperature is None else req.temperature
-    # OpenAI 习惯 temperature=0 表示 greedy,但 SamplingParams 禁止 <= 1e-10,映射成 epsilon
-    temperature = temperature if temperature > 1e-10 else 1e-6
+    # temperature=0 表示 greedy(argmax 取最小下标),由采样 kernel 直接处理
     return SamplingParams(
         temperature=temperature,
         max_tokens=min(max_tokens, args.max_model_len),
@@ -246,7 +245,6 @@ def run(args: argparse.Namespace):
         mm_cache_size_gb=args.mm_cache_size_gb,
         enforce_eager=args.enforce_eager,
         trust_remote_code=args.trust_remote_code,
-        fp8_backend=getattr(args, "fp8_backend", "auto"),
         snapshot_decode_states=getattr(args, "snapshot_decode_states", False),
     )
     app = build_app(args, engine)
