@@ -48,6 +48,8 @@ class MarlinKernel:
 
     name = "marlin"
     priority = 90
+    # fp8 weights x bf16 activations; reported in the loader's one-line summary.
+    scheme = "W8A16"
 
     @classmethod
     def is_available(cls, cfg) -> tuple[bool, str]:

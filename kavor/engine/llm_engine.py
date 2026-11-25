@@ -1,7 +1,6 @@
 import atexit
 import logging
 import signal
-from dataclasses import fields
 from time import monotonic, perf_counter
 
 import torch
@@ -33,80 +32,99 @@ def _worker_entry(config: Config, rank: int, event):
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
-        self.config = config
-        Sequence.block_size = config.kvcache_block_size
-        self.ps = []
+        self.config = Config(model, **kwargs)
+        Sequence.block_size = self.config.kvcache_block_size
+        self.worker_processes = []
         self.events = []
         self._exiting = False
         self.step_stats: list[dict] = []
         self.request_stats: list[dict] = []
         ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
+        
+        for i in range(1, self.config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=_worker_entry, args=(config, i, event))
+            process = ctx.Process(target=_worker_entry, args=(self.config, i, event))
             process.daemon = True
             process.start()
-            self.ps.append(process)
+            self.worker_processes.append(process)
             self.events.append(event)
         atexit.register(self.exit)
+        
         try:
-            self.model_runner = ModelRunner(config, 0, self.events)
+            self.model_runner = ModelRunner(self.config, 0, self.events)
             self.tokenizer = AutoTokenizer.from_pretrained(
-                config.model, use_fast=True, trust_remote_code=config.trust_remote_code)
+                self.config.model, use_fast=True,
+                trust_remote_code=self.config.trust_remote_code
+            )
             self.processor = (
-                AutoProcessor.from_pretrained(config.model, trust_remote_code=config.trust_remote_code)
-                if getattr(config, "vision_config", None) is not None else None)
-            config.eos = self.tokenizer.eos_token_id
-            self.scheduler = Scheduler(config)
+                AutoProcessor.from_pretrained(
+                    self.config.model, 
+                    trust_remote_code=self.config.trust_remote_code
+                )
+                if getattr(self.config, "vision_config", None) is not None else None
+            )
+            self.config.eos = self.tokenizer.eos_token_id
+            self.scheduler = Scheduler(self.config)
         except BaseException:
             self.exit()
             raise
-        logger.info(
-            "模型加载完成: %s | tensor_parallel_size=%d | max_model_len=%d | enforce_eager=%s",
-            config.model, config.tensor_parallel_size, config.max_model_len, config.enforce_eager,
-        )
+        logger.info("Engine initialized with config: %s", self.config)
 
     def exit(self):
         if self._exiting:
             return
         self._exiting = True
-        workers_alive = all(p.is_alive() for p in self.ps)
+        workers_alive = all(
+            process.is_alive() for process in self.worker_processes)
         if getattr(self, "model_runner", None) is not None and workers_alive:
             self.model_runner.call("exit")
             del self.model_runner
-            self._reap_workers(graceful=True)
+            self._shutdown_tp_workers(graceful=True)
         else:
-            self._reap_workers(graceful=False)
+            self._shutdown_tp_workers(graceful=False)
 
-    def _reap_workers(self, graceful: bool):
+    def _shutdown_tp_workers(self, graceful: bool):
+        """Stop the TP worker processes, escalating from join to SIGTERM to SIGKILL.
+
+        With ``graceful=True`` the workers have already been told to exit (via
+        ``model_runner.call("exit")``), so give them WORKER_EXIT_TIMEOUT to wind
+        down before signalling anything.
+        """
         if graceful:
             deadline = monotonic() + WORKER_EXIT_TIMEOUT
-            for p in self.ps:
-                p.join(timeout=max(0.0, deadline - monotonic()))
-        for p in self.ps:
-            if p.is_alive():
-                logger.warning("TP 子进程 %s 未退出,发送 SIGTERM", p.name)
-                p.terminate()
+            for process in self.worker_processes:
+                process.join(timeout=max(0.0, deadline - monotonic()))
+        for process in self.worker_processes:
+            if process.is_alive():
+                logger.warning("TP worker %s did not exit, sending SIGTERM", process.name)
+                process.terminate()
         deadline = monotonic() + WORKER_KILL_TIMEOUT
-        for p in self.ps:
-            p.join(timeout=max(0.0, deadline - monotonic()))
-        for p in self.ps:
-            if p.is_alive():
-                logger.warning("TP 子进程 %s 对 SIGTERM 无响应,发送 SIGKILL", p.name)
-                p.kill()
-                p.join(timeout=2.0)
+        for process in self.worker_processes:
+            process.join(timeout=max(0.0, deadline - monotonic()))
+        for process in self.worker_processes:
+            if process.is_alive():
+                logger.warning("TP worker %s did not respond to SIGTERM, sending SIGKILL", process.name)
+                process.kill()
+                process.join(timeout=2.0)
 
-    def build_inputs(self, messages: list[dict], max_pixels: int | None = None,
-                     processor_kwargs: dict | None = None,
-                     **template_kwargs) -> PromptInputs:
+    def build_inputs(
+        self, 
+        messages: list[dict], 
+        max_pixels: int | None = None,
+        processor_kwargs: dict | None = None,
+        **template_kwargs
+    ) -> PromptInputs:
         assert self.processor is not None, (
-            f"{self.config.model} 没有 processor(AutoProcessor),不支持多模态输入")
+            f"{self.config.model} has no processor (AutoProcessor); "
+            "multimodal inputs are not supported")
         return PromptInputs.build_inputs(
-            self.tokenizer, self.processor, messages, max_pixels=max_pixels,
-            processor_kwargs=processor_kwargs, **template_kwargs)
+            self.tokenizer, 
+            self.processor, 
+            messages, 
+            max_pixels=max_pixels,
+            processor_kwargs=processor_kwargs, 
+            **template_kwargs
+        )
 
     def add_request(
         self,
@@ -116,9 +134,11 @@ class LLMEngine:
     ) -> int:
         if len(inputs.token_ids) > self.config.max_num_batched_tokens:
             raise ValueError(
-                f"prompt 有 {len(inputs.token_ids)} 个 token,超过 max_num_batched_tokens"
-                f"({self.config.max_num_batched_tokens}):多模态序列的 prefill 不切分,排不下就会一直等。"
-                "调大 --max-num-batched-tokens,或用更小的图/更少的帧")
+                f"prompt has {len(inputs.token_ids)} tokens, more than "
+                f"max_num_batched_tokens ({self.config.max_num_batched_tokens}): "
+                "multimodal prefill is not chunked, so an oversized prompt would "
+                "wait forever. Raise --max-num-batched-tokens, or use smaller "
+                "images / fewer frames")
         seq = Sequence(inputs, sampling_params)
         seq.request_id = request_id
         self.scheduler.add(seq)
@@ -134,17 +154,70 @@ class LLMEngine:
         for seq in scheduled_seqs:
             if seq.is_finished:
                 self.log_request_stats(seq, perf_counter())
-        outputs = [(seq.seq_id, seq.completion_token_ids)
-                   for seq in scheduled_seqs if seq.is_finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_seqs if seq.is_finished]
 
         return outputs
 
+    def is_finished(self):
+        return self.scheduler.is_finished()
+    
+    def normalize_inputs(
+        self, 
+        inputs: list[str] | list[list[int]] | list[PromptInputs]
+    ) -> list[PromptInputs]:
+        normalized = []
+        for item in inputs:
+            if isinstance(item, PromptInputs):
+                normalized.append(item)
+            elif isinstance(item, str):
+                token_ids = self.tokenizer.encode(item)
+                normalized.append(PromptInputs(token_ids, item))
+            elif isinstance(item, list):
+                normalized.append(PromptInputs(item, None))
+            elif isinstance(item, int):
+                normalized.append(PromptInputs(torch.tensor(item), None))
+            else:
+                raise RuntimeError("Not supported data type!")
+        return normalized
+
+    def generate(
+        self,
+        inputs: list[str] | list[list[int]] | list[PromptInputs],
+        sampling_params: SamplingParams | list[SamplingParams],
+        use_tqdm: bool = True,
+    ) -> list[str]:
+        # In profile mode keep only the latest generate()'s stats (a warmup call clears them)
+        if self.config.profile:
+            self.step_stats.clear()
+            self.request_stats.clear()
+        inputs = self.normalize_inputs(inputs)
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(inputs)
+        for item, sp in zip(inputs, sampling_params):
+            self.add_request(item, sp)
+        
+        outputs = {}
+
+        pbar = tqdm(total=len(inputs), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        step = self.profile_step if self.config.profile else self.step
+        while not self.is_finished():
+            for seq_id, token_ids in step():
+                outputs[seq_id] = token_ids
+                pbar.update(1)
+        pbar.close()
+        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        return outputs
+
     def profile_step(self):
-        """带统计的 step(config.profile=True 时使用):step/request 级计时落
-        self.step_stats / self.request_stats,语义见 __init__ 注释。"""
+        """Step variant that also records timings (used when config.profile=True).
+
+        Per-step timings go to self.step_stats, per-request timings of finished
+        requests go to self.request_stats.
+        """
         start = perf_counter()
         scheduled_seqs, is_prefill = self.scheduler.schedule()
-        # postprocess 会把 num_scheduled_tokens 清零,token 数必须在这之前取
+        # postprocess zeroes num_scheduled_tokens, so read the count first
         num_tokens = sum(seq.num_scheduled_tokens for seq in scheduled_seqs)
         forward = perf_counter()
         token_ids = self.model_runner.call("run", scheduled_seqs, is_prefill)
@@ -196,14 +269,16 @@ class LLMEngine:
         if prefix_hit is not None:
             parts.append(
                 f"prefix cache hit rate: {prefix_hit}/{prompt}"
-                f" ({100.0 * prefix_hit / prompt:.1f}%)")
+                f" ({100.0 * prefix_hit / prompt:.1f}%)"
+            )
         parts.append(f"output length: {completion} tokens")
         if stats.mm_total_items:
             parts.append(
                 f"mm cache hit items: {stats.mm_hit_items}/{stats.mm_total_items}")
             parts.append(
                 f"mm cache hit rate:"
-                f" {100.0 * stats.mm_hit_items / stats.mm_total_items:.1f}%")
+                f" {100.0 * stats.mm_hit_items / stats.mm_total_items:.1f}%"
+            )
 
         decode_tokens = completion - 1
         decode_time = finish - first if first is not None else 0.0
@@ -221,54 +296,3 @@ class LLMEngine:
         parts.append(f"elapsed: {finish - stats.arrival_time:.2f}s")
 
         logger.info("%s", ", ".join(parts))
-
-    def is_finished(self):
-        return self.scheduler.is_finished()
-    
-    def normalize_inputs(
-        self, 
-        inputs: list[str] | list[list[int]] | list[PromptInputs]
-    ) -> list[PromptInputs]:
-        normalized = []
-        for item in inputs:
-            if isinstance(item, PromptInputs):
-                normalized.append(item)
-            elif isinstance(item, str):
-                token_ids = self.tokenizer.encode(item)
-                normalized.append(PromptInputs(token_ids, item))
-            elif isinstance(item, list):
-                normalized.append(PromptInputs(item, None))
-            elif isinstance(item, int):
-                normalized.append(PromptInputs(torch.tensor(item), None))
-            else:
-                raise RuntimeError("Not supported data type!")
-        return normalized
-
-    def generate(
-        self,
-        inputs: list[str] | list[list[int]] | list[PromptInputs],
-        sampling_params: SamplingParams | list[SamplingParams],
-        use_tqdm: bool = True,
-    ) -> list[str]:
-        # profile 模式下只保留最近一次 generate 的统计(warmup 调用天然自清)
-        if self.config.profile:
-            self.step_stats.clear()
-            self.request_stats.clear()
-        inputs = self.normalize_inputs(inputs)
-        if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(inputs)
-        for item, sp in zip(inputs, sampling_params):
-            self.add_request(item, sp)
-        
-        outputs = {}
-
-        pbar = tqdm(total=len(inputs), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
-        step = self.profile_step if self.config.profile else self.step
-        while not self.is_finished():
-            for seq_id, token_ids in step():
-                outputs[seq_id] = token_ids
-                pbar.update(1)
-        pbar.close()
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        return outputs

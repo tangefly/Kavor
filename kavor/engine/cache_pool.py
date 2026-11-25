@@ -113,7 +113,7 @@ class CachePool:
         
         layout = self.layout
         assert layout is not None, "page pool has not been planned yet"
-        usable = layout.num_blocks - (1 if layout.linear_modules else 0)   # 末块给 CUDA graph 占位
+        usable = layout.num_blocks - (1 if layout.linear_modules else 0)   # last block: CUDA graph padding
         return max(1, usable // resident_blocks_per_seq(1, layout.num_state_groups))
 
     @property
@@ -142,9 +142,10 @@ class CachePool:
         return self.num_blocks - 1 if self.has_linear_attention else None
 
     def copy_blocks(self, src_ids: list[int], dst_ids: list[int]):
-        """整页 D2D 拷贝(所有层池):目前只用于线性状态的交接(见 copy_linear_states)。
+        """Whole-page D2D copy across all layer pools; currently only the linear
+        state handoff uses it (see copy_linear_states).
 
-        与 forward 同一 stream, 由调用方保证在本步 forward 之前发射。
+        Runs on the forward stream, so the caller must launch it before the step's forward.
         """
         if not src_ids:
             return
@@ -183,11 +184,13 @@ class CachePool:
         return torch.tensor(rows, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
     
     def copy_linear_states(self, seqs: list[Sequence]):
-        """把每条序列待交接的线性状态 copy 进它自己的可变块,必须在该步 forward 之前调用。
+        """Copy each sequence's pending linear state into its own mutable blocks;
+        runs before that step's forward.
 
-        序列跨过 chunk 边界或命中前缀快照时,BlockManager 把冻结的快照页记在
-        ``state_copy_src``、换一组新块到 ``state_block_ids``(此时是空的)。这里发整页
-        D2D 拷贝,并让新块接过旧块的状态账本,check_linear_states 的自检照常成立。
+        When a sequence crosses a chunk boundary or hits a prefix snapshot, BlockManager
+        records the frozen pages in ``state_copy_src`` and swaps empty blocks into
+        ``state_block_ids``. The whole-page copy below also hands the old blocks' state
+        ledger to the new ones, which keeps the check_linear_states self-check valid.
         """
         src_ids, dst_ids = [], []
         for seq in seqs:
@@ -295,11 +298,12 @@ class CachePool:
         num_blocks = self._all_reduce_int(
             budget // (num_pools * page_bytes), dist.ReduceOp.MIN)
         assert num_blocks >= 2, (
-            f"页池只能放下 {num_blocks} 块,低于下限 2(1 块给请求、1 块给 CUDA graph 占位)。"
-            f"前向激活预留了 {reserve / 2**20:.0f} MB,"
-            f"显存预算 total*gpu_memory_utilization-used = "
-            f"{(total * self.config.gpu_memory_utilization - used) / 2**30:.2f} GiB。"
-            "请调小 --max-num-seqs / --max-model-len / --gpu-memory-utilization")
+            f"Page pool fits only {num_blocks} blocks, below the minimum of 2 "
+            f"(1 for requests, 1 reserved for CUDA graph padding). The activation "
+            f"reserve is {reserve / 2**20:.0f} MB and the memory budget "
+            f"(total * gpu_memory_utilization - used) is "
+            f"{(total * self.config.gpu_memory_utilization - used) / 2**30:.2f} GiB; "
+            "lower --max-num-seqs / --max-model-len / --gpu-memory-utilization")
         return num_blocks
 
     # memory binding
@@ -356,15 +360,16 @@ class CachePool:
         layout = self.layout
         assert layout is not None, "page pool has not been allocated yet"
         logger.info(
-            "统一页池: %d 块 × %d 层页 × %.2f MB = %.2f GB (block_size=%d, 每 token %.1f KB)",
+            "Unified page pool: %d blocks x %d layer pages x %.2f MB = %.2f GB "
+            "(block_size=%d, %.1f KB per token)",
             layout.num_blocks, layout.num_pools, layout.page_bytes / 2**20,
             layout.num_blocks * layout.num_pools * layout.page_bytes / 2**30,
             layout.block_size, layout.page_bytes / layout.block_size / 1024,
         )
         if layout.linear_modules:
             logger.info(
-                "线性注意力状态: 每层 %.2f MB × %d 层, 分 %d 个块组(每组 %d 层);"
-                " 状态页 padding %.2f MB/层",
+                "Linear attention state: %.2f MB per layer across %d layers, split into "
+                "%d block groups of %d layers, with %.2f MB of page padding per layer",
                 layout.max_state_bytes / 2**20, len(layout.linear_modules),
                 layout.num_state_groups, layout.num_pools,
                 (layout.page_bytes - layout.max_state_bytes) / 2**20,

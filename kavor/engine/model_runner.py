@@ -97,10 +97,10 @@ class ModelRunner:
         n = len(data)
         if n + 4 > len(self.shm.buf):
             raise RuntimeError(
-                f"要发给 TP worker 的数据有 {n / 2**20:.1f} MB,超过共享内存 "
-                f"{len(self.shm.buf) / 2**20:.0f} MB:args 里不要夹带大张量"
-                "(多模态的像素张量应该在 MMInputs.for_workers 里就被丢掉,"
-                "改走 mm_inputs 里 scatter_pixels_to_ranks 那条 NCCL 数据面)")
+                f"TP worker payload is {n / 2**20:.1f} MB, over the "
+                f"{len(self.shm.buf) / 2**20:.0f} MB shared buffer: keep large tensors "
+                "out of args; multimodal pixels travel over NCCL "
+                "(mm_inputs.scatter_pixels_to_ranks), not shared memory")
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
@@ -144,7 +144,8 @@ class ModelRunner:
                     slot_mapping, None, None, self._padding_slot_ids(num_seqs))
         try:
             logits = self.model.compute_logits(self.model(input_ids, positions))
-            # gather 之后只有 rank0 有 logits(见 ParallelLMHead),采样本来也只在 rank0 跑
+            # only rank 0 holds logits after the gather (see ParallelLMHead), and
+            # sampling runs on rank 0 anyway
             if self.rank == 0:
                 self.sampler(logits, torch.ones(num_seqs, dtype=torch.float32, device="cuda"))
         finally:
@@ -162,7 +163,7 @@ class ModelRunner:
             input_ids = torch.zeros(bs, dtype=torch.int64, device="cuda")
             positions = torch.zeros(bs, dtype=torch.int64, device="cuda")
             logits = self.model.compute_logits(self.model(input_ids, positions))
-            # 同 warmup_model:非 0 号 rank 上没有 logits,采样只在 rank0 做
+            # as in warmup_model: non-zero ranks have no logits, sampling is rank-0 only
             if self.rank == 0:
                 self.sampler(logits, torch.ones(bs, dtype=torch.float32, device="cuda"))
         finally:
@@ -199,10 +200,10 @@ class ModelRunner:
         reserve = graph_pool + max(prefill_peak, decode_peak)
         if self.enable_log:
             logger.info(
-                "激活 profiling: prefill %.2f GiB, decode(bs=%d) %.2f GiB,"
-                " CUDA graph 池 %.2f GiB -> 预留 %.2f GiB",
-                prefill_peak / 2**30, max_bs, decode_peak / 2**30,
-                graph_pool / 2**30, reserve / 2**30)
+                "Reserving %.2f GiB for activations: prefill %.2f GiB, "
+                "decode %.2f GiB at bs=%d, CUDA graph pool %.2f GiB",
+                reserve / 2**30, prefill_peak / 2**30,
+                decode_peak / 2**30, max_bs, graph_pool / 2**30)
         return reserve
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -238,7 +239,8 @@ class ModelRunner:
                 graph_vars["linear_slot_ids"].fill_(self.cache.linear_padding_slot)
                 graph_vars["linear_slot_ids"][:bs] = context.linear_slot_ids
             if self.graph_captures_head:
-                # lm_head + 采样在图内:温度写进持久 buffer,replay 直接产出 token
+                # lm_head + sampling live in the graph: temperatures go to a
+                # persistent buffer and replay produces the tokens directly
                 graph_vars["temperatures"][:bs].copy_(temperatures)
                 graph.replay()
                 return None
@@ -254,7 +256,7 @@ class ModelRunner:
         finally:
             self.mm_assembler.release_pins()
         self.cache.record_linear_states(seqs)
-        if logits is None:    # graph 已含 lm_head+采样
+        if logits is None:    # the graph already includes lm_head + sampling
             bs = input_ids.size(0)
             token_ids = self.graph_vars["sampled_tokens"][:bs].tolist()
         else:
@@ -276,8 +278,8 @@ class ModelRunner:
         outputs = torch.zeros(max_bs, text_config.hidden_size)
         temperatures = torch.ones(max_bs, dtype=torch.float32)
         sampled_tokens = torch.zeros(max_bs, dtype=torch.int64)
-        # TP>1 时 ParallelLMHead 的 dist.gather(NCCL p2p 实现)进 CUDA graph
-        # 有挂死风险,lm_head+采样保持图外 eager
+        # With TP>1 the dist.gather in ParallelLMHead can hang when captured, so
+        # keep lm_head + sampling eager
         self.graph_captures_head = self.world_size == 1
         linear_slot_ids = (None if self.cache.linear_padding_slot is None else
                            torch.full((max_bs, self.cache.num_state_groups),
@@ -304,7 +306,7 @@ class ModelRunner:
                         linear_slot_ids=None if linear_slot_ids is None else linear_slot_ids[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             if self.graph_captures_head:
-                forward_with_head(bs)    # 图内链路先 eager 一遍:JIT + 显存预算进池
+                forward_with_head(bs)    # eager first: JIT and memory land in the pool
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
                 if self.graph_captures_head:
@@ -328,39 +330,44 @@ class ModelRunner:
         )
 
     def allocate_kv_cache(self):
-        """两段式建页池:先绑临时小池实测前向峰值,再按预留量规划正式池。
+        """Build the page pool in two phases: probe the forward peak on a small
+        temporary pool, then plan the real pool around the measured reserve.
 
-        ``gpu_memory_utilization`` 约束的是「权重 + 页池 + 前向峰值」,而页池大小又反过来
-        决定前向峰值(峰值里最大的一项是 batch 维度的线性注意力状态),所以先做一次乐观
-        估计拿到 profiling 用的 batch,再实测、再正式规划。
+        ``gpu_memory_utilization`` bounds weights + page pool + forward peak, and
+        the pool size itself moves that peak (its largest term is the batch-sized
+        linear-attention state), so plan optimistically, profile, then plan again.
         """
-        # mm 池必须先于 KV 池分配:下面的 _probe_num_blocks 靠 mem_get_info 反推
-        # 可用预算,活着的 mm 池会自动从 KV 预算里扣掉
+        # the mm pool must come first: the KV budget is derived from mem_get_info,
+        # so a live mm pool is subtracted automatically
         self.mm_cache = MMCache.from_config(self.config)
         if self.mm_cache is not None and not hasattr(self.model, "get_mm_embeddings"):
             if self.enable_log:
-                logger.warning("模型没有实现 get_mm_embeddings,mm cache 不生效")
+                logger.warning(
+                    "mm cache disabled: the model does not implement get_mm_embeddings")
             self.mm_cache = None
         if self.enable_log:
             if self.mm_cache is not None:
                 self.mm_cache.log_summary()
             elif self.config.enable_mm_cache:
-                reason = ("模型没有视觉塔" if self.config.vision_config is None
-                          else "--mm-cache-size-gb 不大于 0")
-                logger.warning("enable_mm_cache 已开启但%s,mm cache 不生效", reason)
+                reason = (
+                    "the model has no vision tower" if self.config.vision_config is None
+                    else "--mm-cache-size-gb is not positive")
+                logger.warning("mm cache disabled: enable_mm_cache is on but %s", reason)
 
         self.cache = CachePool(self.model, self.config, self.world_size)
 
-        # 1) 乐观规划(不留激活余量):真实容量不会超过它,用它决定 profiling 的 batch 上界
+        # 1) optimistic plan without an activation reserve; real capacity never
+        #    exceeds it, so it caps the batch size used for profiling
         self.cache.plan()
         probe_bs = min(self.config.max_num_seqs, 512, self.cache.max_concurrent())
 
-        # 2) 绑一个刚好能跑完 prefill profiling 的临时池(prefill 的 slot_mapping 必须落在池内)
+        # 2) temporary pool just big enough for the prefill profiling pass, since
+        #    prefill slot_mapping must land inside the pool
         seq_len, num_seqs = self.profile_prefill_shape()
         profile_blocks = (seq_len * num_seqs + self.cache.block_size - 1) // self.cache.block_size + 2
         self.cache.allocate(num_blocks=profile_blocks)
 
-        # 3) 实测峰值,再建正式池(allocate 会先释放临时池)
+        # 3) measure the peak, then build the real pool (allocate frees the temp one)
         reserve = self.profile_activation_peak(probe_bs)
         layout = self.cache.allocate(reserve=reserve)
 
@@ -371,12 +378,14 @@ class ModelRunner:
         self.config.has_linear_attention = self.cache.has_linear_attention
         self.config.num_linear_state_groups = self.cache.num_state_groups
 
-        # 4) 把 max_num_seqs 收敛到页池真正能容纳的并发:Scheduler 和 CUDA graph 都用这个值
+        # 4) clamp max_num_seqs to what the pool can really hold; the Scheduler and
+        #    the CUDA graphs both use this value
         capacity = self.cache.max_concurrent()
         if capacity < self.config.max_num_seqs:
             if self.enable_log:
                 logger.warning(
-                    "max_num_seqs %d -> %d:页池只有 %d 块,每条序列至少要 1 个 KV 块 + %d 个状态块",
+                    "Lowering max_num_seqs from %d to %d: the pool has %d blocks "
+                    "and each sequence needs 1 KV block plus %d state blocks",
                     self.config.max_num_seqs, capacity, self.cache.num_blocks,
                     self.cache.num_state_groups)
             self.config.max_num_seqs = capacity
@@ -384,7 +393,8 @@ class ModelRunner:
             self.cache.log_summary()
 
     def prepare_prefill(self, seqs: list[Sequence]):
-        # 命中前缀快照、或刚跨过 chunk 边界的序列:先把冻结的状态 copy 进自己的可变块
+        # sequences that hit a prefix snapshot or just crossed a chunk boundary:
+        # copy the frozen state into their own mutable blocks first
         self.cache.copy_linear_states(seqs)
         input_ids = []
         positions = []
@@ -426,7 +436,7 @@ class ModelRunner:
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         if has_mm:
-            positions = torch.cat(positions, dim=1).cuda(non_blocking=True)     # (3, 总 token 数)
+            positions = torch.cat(positions, dim=1).cuda(non_blocking=True)     # (3, total tokens)
         else:
             positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -437,7 +447,8 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
-        # 刚跨过 chunk 边界的序列:冻结的快照 copy 进新块,再在新块上原地解码
+        # sequences that just crossed a chunk boundary: copy the frozen snapshot
+        # into the new block, then decode in place on it
         self.cache.copy_linear_states(seqs)
         self.cache.check_linear_states(seqs)
         input_ids = []

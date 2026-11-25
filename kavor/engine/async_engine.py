@@ -26,16 +26,18 @@ class AsyncEngine:
 
     EXIT_TIMEOUT = 10.0
 
-    def __init__(self, model: str, **kwargs):
-        
-        self.model_name = kwargs["model_name"] or model
+    def __init__(self, model: str, model_name: str | None = None, **kwargs):
+
+        self.model_name = model_name or model
         self.engine = LLMEngine(model, **kwargs)
         self.tokenizer = self.engine.tokenizer
         self.processor = self.engine.processor
+
         self.loop: asyncio.AbstractEventLoop | None = None
 
         self.incoming: queue.Queue = queue.Queue()
         self.new_request_event = threading.Event()
+
         self.tracker: dict[int, RequestState] = {}
         self._cursors: dict[int, int] = {}
 
@@ -47,14 +49,20 @@ class AsyncEngine:
         self.thread = threading.Thread(target=self._engine_loop, name="kavor-engine", daemon=True)
         self.thread.start()
 
-    async def add_request(self, request_id: str, inputs: str | list[int] | PromptInputs,
-                          sampling_params: SamplingParams) -> asyncio.Queue:
+    async def add_request(
+        self, 
+        request_id: str, 
+        inputs: str | list[int] | PromptInputs,
+        sampling_params: SamplingParams
+    ) -> asyncio.Queue:
+        
         if self._exc is not None:
-            raise RuntimeError(f"引擎线程已因异常退出: {self._exc!r}")
+            raise RuntimeError(f"Engine thread exited with an exception: {self._exc!r}")
         if self._shutdown:
-            raise RuntimeError("引擎已关闭,拒绝新请求")
+            raise RuntimeError("Engine is shut down, rejecting new requests")
         if self.loop is None:
-            raise RuntimeError("AsyncEngine.loop 未注入,请在 lifespan 里设置")
+            raise RuntimeError("AsyncEngine.loop is not set; assign it in the lifespan")
+
         q: asyncio.Queue = asyncio.Queue()
         self.incoming.put((request_id, inputs, sampling_params, q))
         self.new_request_event.set()
@@ -74,7 +82,8 @@ class AsyncEngine:
             self.thread.join(timeout=self.EXIT_TIMEOUT)
 
         if self.thread.is_alive():
-            logger.warning("引擎线程 %.1fs 内未退出,跳过显式清理,交给 atexit", self.EXIT_TIMEOUT)
+            logger.warning("Engine thread did not exit within %.1fs; skipping explicit "
+                           "cleanup and leaving it to atexit", self.EXIT_TIMEOUT)
             return
 
         self.engine.exit()
@@ -119,7 +128,7 @@ class AsyncEngine:
         except BaseException as e:
             self._exc = e
             self._traceback = traceback.format_exc()
-            logger.exception("引擎线程异常退出")
+            logger.exception("Engine thread crashed")
         finally:
             self._fail_all_requests()
 
@@ -133,7 +142,7 @@ class AsyncEngine:
                 seq_id = self.engine.add_request(
                     inputs, sampling_params, request_id=request_id)
             except BaseException:
-                logger.exception("请求 %s 提交失败", request_id)
+                logger.exception("Failed to submit request %s", request_id)
                 self._push(q, ("finish", "error"))
                 self._push(q, None)
                 continue

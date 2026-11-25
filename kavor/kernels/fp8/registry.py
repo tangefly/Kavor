@@ -1,24 +1,3 @@
-"""FP8 线性层 kernel 的选择机制。
-
-每个 layer 在加载期选一次 kernel(``prepare``),forward 只走选中的那条,
-没有运行时分支,对 CUDA graph 友好。候选按 priority 从高到低:
-
-======================  ========  =========================================
-kernel                  priority  条件
-======================  ========  =========================================
-FlashInferKernel        100       SM90、bf16、fp32 scale、N%64/K%128
-MarlinKernel            90        SM80/86/89/90、可构建、128 block、bf16/fp16
-TritonW8A16Kernel       50        CUDA、bf16、128 block
-TritonW8A8Kernel        40        SM89+、bf16、128 block
-======================  ========  =========================================
-
-规则:
-
-- ``backend != "auto"`` 只尝试指定 kernel,不满足直接报错并给出原因;
-- ``auto`` 按 priority 选第一个可用的;Marlin 构建失败会被缓存,继续下一个;
-- ``KAVOR_DISABLED_KERNELS``(逗号分隔)在两种模式下都生效。
-"""
-
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -47,6 +26,8 @@ class Fp8LinearConfig:
 class Fp8Kernel(ABC):
     name: str = ""
     priority: int = 0
+    # W8A8: fp8 weights x fp8 activations, W8A16: fp8 weights x bf16 activations.
+    scheme: str = ""
 
     @classmethod
     @abstractmethod
@@ -70,6 +51,7 @@ class Fp8Kernel(ABC):
 class FlashInferKernel(Fp8Kernel):
     name = "flashinfer"
     priority = 100
+    scheme = "W8A8"
 
     @classmethod
     def is_available(cls, cfg):
@@ -98,6 +80,7 @@ class FlashInferKernel(Fp8Kernel):
 class TritonW8A16Kernel(Fp8Kernel):
     name = "triton_w8a16"
     priority = 50
+    scheme = "W8A16"
 
     @classmethod
     def is_available(cls, cfg):
@@ -122,6 +105,7 @@ class TritonW8A16Kernel(Fp8Kernel):
 class TritonW8A8Kernel(Fp8Kernel):
     name = "triton_w8a8"
     priority = 40
+    scheme = "W8A8"
 
     @classmethod
     def is_available(cls, cfg):
@@ -182,7 +166,7 @@ def select_kernel(cfg: Fp8LinearConfig, backend: str, prefix: str = "") -> Fp8Ke
             reasons.append(f"{cls.name}: {why}")
             continue
         kernel = cls()
-        logger.info(
+        logger.debug(
             "%sSelected fp8 kernel %s (N=%d K=%d dtype=%s)",
             f"{prefix}: " if prefix else "", kernel.name, cfg.n, cfg.k,
             cfg.input_dtype)

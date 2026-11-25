@@ -25,11 +25,10 @@ class AutoModelForCausalLM:
         use_tqdm,
         **kwargs,
     ):
-        model_class = cls._get_model_class(hfconfig)
-        # 量化配置挂到 config 上,模型构造时按模块路径(prefix)决定是否量化;
-        # 具体 kernel 由 registry 在加载期从可用后端里自动选最优的
+        model_class = cls.get_model_class(hfconfig)
         hfconfig.quant_config = Fp8Config.from_config(
-            getattr(hfconfig, "quantization_config", None))
+            getattr(hfconfig, "quantization_config", None)
+        )
         model = model_class(hfconfig)
         cls.load_weight(model, hfconfig.name_or_path, use_tqdm)
         cls._prepare_quantized_layers(model)
@@ -37,21 +36,48 @@ class AutoModelForCausalLM:
 
     @classmethod
     def _prepare_quantized_layers(cls, model: nn.Module) -> None:
-        """权重加载完成后,让每个量化 Linear 选 kernel 并做一次性布局转换。
+        """Pick a kernel for every quantized Linear and convert its layout once.
 
-        必须在 KV cache 分配和 CUDA graph capture 之前执行(见 model_runner)。
+        Runs after the weights are loaded. Must happen before the KV cache is
+        allocated and the CUDA graphs are captured (see model_runner).
         """
-        prepared = 0
+        # kernel name -> (scheme, layer count); per-layer choices are debug logs,
+        # the whole model is summarized in one info line below
+        kernels: dict[str, tuple[str, int]] = {}
+        experts = 0
         for module in model.modules():
             method = getattr(module, "quant_method", None)
-            if method is not None and hasattr(method, "prepare_kernel"):
-                method.prepare_kernel(module)
-                prepared += 1
-        if prepared:
-            logger.info("已为 %d 个量化层准备 kernel", prepared)
+            if method is None or not hasattr(method, "prepare_kernel"):
+                continue
+            method.prepare_kernel(module)
+            kernel = getattr(method, "kernel", None)
+            if kernel is None:
+                # MoE experts pick their kernel inside fused_moe, not here
+                experts += 1
+                continue
+            scheme, count = kernels.get(kernel.name, (kernel.scheme, 0))
+            kernels[kernel.name] = (scheme, count + 1)
+        if kernels or experts:
+            cls._log_quant_summary(kernels, experts)
+
+    @staticmethod
+    def _log_quant_summary(kernels: dict[str, tuple[str, int]], experts: int) -> None:
+        def count(n: int, noun: str) -> str:
+            return f"{n} {noun}" + ("" if n == 1 else "s")
+
+        by_kernel = sorted(kernels.items(), key=lambda kv: -kv[1][1])
+        # First group carries the noun ("407 linear layers on marlin (W8A16)"),
+        # later ones drop it ("7 on triton_w8a8 (W8A8)") to stay short.
+        groups = [
+            f"{count(n, 'linear layer') if i == 0 else n} on {name} ({scheme})"
+            for i, (name, (scheme, n)) in enumerate(by_kernel)
+        ]
+        if experts:
+            groups.append(f"{count(experts, 'MoE expert module')} on fused_moe")
+        logger.info("FP8 quantization: %s", ", ".join(groups))
 
     @classmethod
-    def _get_model_class(
+    def get_model_class(
         cls: type["AutoModelForCausalLM"],
         hfconfig,
         **kwargs,
@@ -74,10 +100,11 @@ class AutoModelForCausalLM:
         weights,
         packed_modules_mapping: dict,
     ) -> tuple[set[str], list[tuple[str, int]]]:
-        """把 checkpoint 的权重按名字灌进模型。
+        """Copy the checkpoint weights into the model by parameter name.
 
-        返回 (已加载的参数名, 被忽略的 key 及其字节数)。
-        忽略哪些由模型类的 ignore_weight_prefixes 显式声明(如 mtp.),没声明就不忽略任何东西。
+        Returns (names of loaded parameters, ignored keys with their byte size).
+        Which keys are ignored is declared explicitly by the model class via
+        ignore_weight_prefixes (e.g. mtp.); without a declaration nothing is ignored.
         """
         ignore_prefixes = getattr(model, "ignore_weight_prefixes", ())
         loaded = set()
@@ -86,8 +113,10 @@ class AutoModelForCausalLM:
             if weight_name.startswith(ignore_prefixes):
                 skipped.append((weight_name, loaded_weight.numel() * loaded_weight.element_size()))
                 continue
-            # per-expert 权重(checkpoint 按专家分散)拼进堆叠 3D 参数:模型自己声明
-            # 解析函数,返回已写入的参数全名;没有声明或没匹配上的走默认路径
+            # Per-expert weights (the checkpoint stores each expert separately) are
+            # packed into a stacked 3D parameter: the model declares a resolver that
+            # returns the full name of the parameter it wrote, or None to fall back
+            # to the default path
             resolve_stacked = getattr(model, "resolve_stacked_weight", None)
             if resolve_stacked is not None:
                 stacked_name = resolve_stacked(weight_name, loaded_weight)
@@ -148,8 +177,8 @@ class AutoModelForCausalLM:
             load_file = cls._load_bin
         if not files:
             raise FileNotFoundError(
-                f"{path} 下没有找到权重文件(*.safetensors 或 *.bin),"
-                f"确认 --model 指向的是完整的 HF 模型目录")
+                f"No weight files (*.safetensors or *.bin) found under {path}; "
+                f"make sure --model points to a complete HF model directory")
 
         loaded: set[str] = set()
         skipped: list[tuple[str, int]] = []
@@ -173,7 +202,7 @@ class AutoModelForCausalLM:
         prefixes = ", ".join(p for p in ignore_prefixes if any(n.startswith(p) for n, _ in skipped))
         preview = ", ".join(name for name, _ in skipped[:3]) + (", ..." if len(skipped) > 3 else "")
         logger.info(
-            "按声明忽略 %d 个权重(前缀 %s, 共 %.1f MB): %s",
+            "Ignored %d weights as declared (prefixes %s, %.1f MB total): %s",
             len(skipped), prefixes, total_mb, preview,
         )
 
@@ -189,4 +218,4 @@ class AutoModelForCausalLM:
         if missing:
             preview = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
             raise RuntimeError(
-                f"有 {len(missing)} 个参数没有从 checkpoint 加载到: {preview}")
+                f"{len(missing)} parameters were not loaded from the checkpoint: {preview}")

@@ -147,3 +147,9 @@ def test_auto_falls_back_to_triton_when_marlin_unavailable(monkeypatch):
         registry.FlashInferKernel, "is_available",
         classmethod(lambda cls, cfg: (False, "no flashinfer")))
     assert select_kernel(_cfg(), "auto").name == "triton_w8a16"
+
+
+def test_every_kernel_declares_a_scheme():
+    """加载器按 kernel.scheme 汇总 W8A8/W8A16;Marlin 不继承 Fp8Kernel,漏了会直接崩。"""
+    for cls in registry._ORDERED:
+        assert cls.scheme in ("W8A8", "W8A16"), f"{cls.name} 没有声明 scheme"

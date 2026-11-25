@@ -72,3 +72,33 @@ class Config:
         
         max_position_embeddings = self.text_config.max_position_embeddings
         self.max_model_len = min(self.max_model_len, max_position_embeddings)
+
+    def __str__(self) -> str:
+        """Flat `key=value` dump of the resolved runtime config (vLLM-style).
+
+        The resolved HF config objects are left out: they are huge and already
+        summed up by the fields below. Values that the engine refines at load
+        time (kvcache_block_size, num_kvcache_blocks, max_num_seqs, ...) reflect
+        those refinements once logging happens.
+        """
+        return (
+            f"model={self.model!r}, "
+            f"architectures={getattr(self.text_config, 'architectures', None)}, "
+            f"dtype={self.text_config.dtype}, "
+            f"tensor_parallel_size={self.tensor_parallel_size}, "
+            f"max_model_len={self.max_model_len}, "
+            f"max_num_batched_tokens={self.max_num_batched_tokens}, "
+            f"max_num_seqs={self.max_num_seqs}, "
+            f"gpu_memory_utilization={self.gpu_memory_utilization}, "
+            f"kvcache_block_size={self.kvcache_block_size}, "
+            f"num_kvcache_blocks={self.num_kvcache_blocks}, "
+            f"has_linear_attention={self.has_linear_attention}, "
+            f"num_linear_state_groups={self.num_linear_state_groups}, "
+            f"snapshot_decode_states={self.snapshot_decode_states}, "
+            f"enable_mm_cache={self.enable_mm_cache}, "
+            f"mm_cache_size_gb={self.mm_cache_size_gb}, "
+            f"enforce_eager={self.enforce_eager}, "
+            f"profile={self.profile}, "
+            f"trust_remote_code={self.trust_remote_code}, "
+            f"rdzv_port={self.rdzv_port}"
+        )
