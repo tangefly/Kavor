@@ -1,26 +1,3 @@
-"""MoE 专家前向:静态网格分组 GEMM,可进 CUDA graph。
-
-路由出来的 token-expert 对(slot)先按专家排序、再按 BLOCK_M 对齐,然后：
-
-1. ``gate_up_silu``：每个 (token-block, 中间维-block) 一个 CTA,该 block 内的
-   slot 同属一个专家,权重只读一次;gate/up 两个累加器在寄存器里算完直接
-   ``silu(gate) * up``,不落 2I 宽的中间结果;
-2. ``down_weighted``：再乘 routing weight,以 fp32 atomic 累加回 token 行。
-
-对齐(``moe_align_block_size``)全用 torch 设备端算子(sort/bincount/cumsum/
-searchsorted/scatter),形状只由 token 数、top_k、专家数决定,**没有 host
-同步、没有 .item()**,所以整条 MoE 前向可以被 CUDA graph 捕获。这与纯
-torch 的"按专家循环 + nonzero"实现(以及 ``torch._grouped_mm``,实测捕获即
-失败)是本质区别。
-
-fp8 路径(W8A16)与 bf16 路径共用同一套 kernel:``HAS_SCALE`` 打开时按
-128x128 block scale 乘在部分和上,数值路径与
-``kavor/kernels/fp8/triton_w8a16.py`` 一致。
-
-down 的 fp32 atomic 归约顺序不确定,末位比特级非确定(推理可接受,与
-split-K 的取舍相同)。
-"""
-
 import os
 
 import torch

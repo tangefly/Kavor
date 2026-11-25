@@ -4,15 +4,15 @@ from torch import nn
 
 
 class BlockQuantScaleParameter(nn.Parameter):
-    """128x128 blockwise weight scale 的类型标记。
+    """Marker type for 128x128 blockwise weight scales.
 
-    Linear 的 weight_loader 靠 isinstance(param, BlockQuantScaleParameter)
-    把"元素单位的分片"换算成"block 单位的分片";权重本身不走这条分支。
+    ``weight_loader`` uses ``isinstance`` to tell scale params from weights and
+    convert an element-sized shard into the corresponding block-sized shard.
     """
 
 
 class UnquantizedLinearMethod:
-    """不量化的 Linear:保持 Kavor 原有行为(默认 dtype 权重 + F.linear)。"""
+    """Unquantized linear: weights in their default dtype, computed with ``F.linear``."""
 
     def create_weights(self, layer, input_size, output_size, weight_loader):
         weight = nn.Parameter(torch.empty(output_size, input_size))
@@ -24,10 +24,11 @@ class UnquantizedLinearMethod:
 
 
 class UnquantizedMoeMethod:
-    """不量化的 MoE 专家:按专家堆叠的 bf16 3D 权重。
+    """Unquantized MoE experts, stored as per-expert stacked 3D bf16 weights.
 
-    gate/up 合并成 ``gate_up_proj``(E, 2*local_inter, H):前一半 gate、后一半
-    up;``down_proj`` 是 (E, H, local_inter)。local_inter 已按 TP 切过。
+    ``gate_up_proj`` is ``(E, 2 * local_inter, H)`` with gate first and up
+    second; ``down_proj`` is ``(E, H, local_inter)``. ``local_inter`` is
+    already sharded by TP.
     """
 
     def create_weights(self, layer, num_experts, local_inter, hidden_size, weight_loader):
@@ -38,7 +39,8 @@ class UnquantizedMoeMethod:
         down = nn.Parameter(torch.empty(num_experts, hidden_size, local_inter))
         down.weight_loader = weight_loader
         layer.down_proj = down
-        # 统一接口:未量化时 scale 不存在,forward 里靠 None 走无 scale 的 kernel
+        # Same interface as quantized methods: no scales here, so the kernel is
+        # selected by passing None below.
         layer.register_parameter("gate_up_scale_inv", None)
         layer.register_parameter("down_scale_inv", None)
 

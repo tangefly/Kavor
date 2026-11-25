@@ -11,6 +11,7 @@ def divide(numerator, denominator):
 
 
 class LinearBase(nn.Module):
+    """Base class for TP linear layers: owns the parallel context and quant method."""
 
     def __init__(
         self,
@@ -41,6 +42,7 @@ class LinearBase(nn.Module):
 
 
 class ReplicatedLinear(LinearBase):
+    """Not sharded: every TP rank keeps the full weight and computes independently."""
 
     def __init__(
         self,
@@ -61,6 +63,7 @@ class ReplicatedLinear(LinearBase):
 
 
 class ColumnParallelLinear(LinearBase):
+    """Sharded on the output dim (dim 0): each rank owns ``output_size / tp_size`` rows."""
 
     def __init__(
         self,
@@ -76,7 +79,6 @@ class ColumnParallelLinear(LinearBase):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
-        # scale 参数在 dim 0 上就是 block 数,均分逻辑与权重一致
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
@@ -88,6 +90,7 @@ class ColumnParallelLinear(LinearBase):
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
+    """Sharded on dim 0 over concatenated matrices; ``loaded_shard_id`` picks the block to load."""
 
     def __init__(
         self,
@@ -106,7 +109,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
         if isinstance(param, BlockQuantScaleParameter):
-            # scale 的行数是 block 数:元素单位的分片换算成 block 单位
             block_n = self.weight_block_size[0]
             shard_offset, shard_size = shard_offset // block_n, shard_size // block_n
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
@@ -116,6 +118,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
+    """Sharded on dim 0 by heads: Q heads and KV heads are each split by ``tp_size``."""
 
     def __init__(
         self,
@@ -130,6 +133,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         prefix: str = "",
     ):
         tp_size = dist.get_world_size()
+        # With gated attention, q_proj packs q and its gate together, so the q
+        # block is twice as wide; weight_loader needs this to offset k/v.
         self.q_mult = 2 if q_gate else 1
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
@@ -153,7 +158,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_size = kv_size
             shard_offset = q_size + kv_size
         if isinstance(param, BlockQuantScaleParameter):
-            # scale 的行数是 block 数:元素单位的分片换算成 block 单位
             block_n = self.weight_block_size[0]
             shard_size, shard_offset = shard_size // block_n, shard_offset // block_n
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
@@ -163,6 +167,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
+    """Sharded on the input dim (dim 1); partial outputs are summed with ``all_reduce``."""
 
     def __init__(
         self,
@@ -181,7 +186,6 @@ class RowParallelLinear(LinearBase):
         if param_data.ndim == 1:
             param_data.copy_(loaded_weight)
             return
-        # scale 参数在 dim 1 上就是 block 数,均分逻辑与权重一致
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
