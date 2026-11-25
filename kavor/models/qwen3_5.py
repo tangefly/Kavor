@@ -1346,7 +1346,11 @@ class Qwen3_5Model(nn.Module):
                 )
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        position_ids = torch.arange(inputs_embeds.shape[0], device=inputs_embeds.device)
+        if position_ids is None:
+            # 纯文本且外部没给位置时退化到 arange;decode / 带 prefix cache 的
+            # prefill 必须用调用方给的绝对位置(否则位置恒从 0 开始,注意力对不上)
+            position_ids = torch.arange(
+                inputs_embeds.shape[0], device=inputs_embeds.device)
 
         return self.language_model(
             position_ids=position_ids,

@@ -2,7 +2,11 @@ import torch
 from torch import nn
 
 from kavor.kernels.fp8.registry import Fp8LinearConfig, select_kernel
-from kavor.layers.quant.base import BlockQuantScaleParameter, UnquantizedLinearMethod
+from kavor.layers.quant.base import (
+    BlockQuantScaleParameter,
+    UnquantizedLinearMethod,
+    UnquantizedMoeMethod,
+)
 
 
 class Fp8BlockLinearMethod:
@@ -68,6 +72,82 @@ class Fp8BlockLinearMethod:
         return self.kernel.apply(layer, x, bias)
 
 
+class Fp8BlockMoeMethod:
+    """FP8 E4M3 专家权重 + 128×128 blockwise scale(按专家堆叠)。
+
+    checkpoint 里专家是每个专家一组 2D 权重(``experts.<i>.gate_proj`` 等),
+    加载期由 ``Qwen3_5MoeExperts.weight_loader`` 拼成 3D 参数:
+
+    - ``gate_up_proj``  (E, 2*local_inter, H)  fp8,gate 在前、up 在后
+    - ``gate_up_scale_inv`` (E, 2*local_inter/128, H/128) fp32
+    - ``down_proj`` (E, H, local_inter) fp8
+    - ``down_scale_inv`` (E, H/128, local_inter/128) fp32
+
+    具体 GEMM 由 ``kavor/kernels/moe.py`` 的融合 kernel 做(W8A16,块 scale
+    乘在部分和上,数值路径同 triton_w8a16),不需要像 Linear 那样在多个
+    后端之间选。
+    """
+
+    def __init__(self, quant_config, prefix: str = ""):
+        self.weight_block_size = quant_config.weight_block_size
+        self.prefix = prefix
+
+    def create_weights(self, layer, num_experts, local_inter, hidden_size, weight_loader):
+        block_n, block_k = self.weight_block_size
+        two_inter = 2 * local_inter
+        assert two_inter % block_n == 0 and hidden_size % block_k == 0, (
+            f"专家 gate/up 权重 [{two_inter}, {hidden_size}] 无法按 block "
+            f"{self.weight_block_size} 对齐")
+        assert hidden_size % block_n == 0 and local_inter % block_k == 0, (
+            f"专家 down 权重 [{hidden_size}, {local_inter}] 无法按 block "
+            f"{self.weight_block_size} 对齐")
+        layer.orig_dtype = torch.get_default_dtype()
+        layer.weight_block_size = self.weight_block_size
+
+        gate_up = nn.Parameter(
+            torch.empty(num_experts, two_inter, hidden_size,
+                        dtype=torch.float8_e4m3fn),
+            requires_grad=False)
+        gate_up.weight_loader = weight_loader
+        layer.gate_up_proj = gate_up
+        gate_up_scale = BlockQuantScaleParameter(
+            torch.empty(num_experts, two_inter // block_n, hidden_size // block_k,
+                        dtype=torch.float32),
+            requires_grad=False)
+        gate_up_scale.weight_loader = weight_loader
+        layer.gate_up_scale_inv = gate_up_scale
+
+        down = nn.Parameter(
+            torch.empty(num_experts, hidden_size, local_inter,
+                        dtype=torch.float8_e4m3fn),
+            requires_grad=False)
+        down.weight_loader = weight_loader
+        layer.down_proj = down
+        down_scale = BlockQuantScaleParameter(
+            torch.empty(num_experts, hidden_size // block_n, local_inter // block_k,
+                        dtype=torch.float32),
+            requires_grad=False)
+        down_scale.weight_loader = weight_loader
+        layer.down_scale_inv = down_scale
+
+    def prepare_kernel(self, layer):
+        from kavor.utils.logger import logger
+
+        logger.debug(
+            "%sFP8 MoE experts: E=%d gate_up=%s down=%s",
+            f"{self.prefix}: " if self.prefix else "",
+            layer.gate_up_proj.shape[0],
+            tuple(layer.gate_up_proj.shape), tuple(layer.down_proj.shape))
+
+    def apply(self, layer, x, topk_ids, topk_weights):
+        from kavor.kernels.moe import fused_moe
+
+        return fused_moe(
+            x, topk_ids, topk_weights,
+            layer.gate_up_proj, layer.gate_up_scale_inv,
+            layer.down_proj, layer.down_scale_inv)
+
+
 class Fp8Config:
     """HF quantization_config 的 FP8 解析;按模块路径(prefix)决定是否量化。"""
 
@@ -108,3 +188,8 @@ class Fp8Config:
         if self.is_layer_skipped(prefix):
             return UnquantizedLinearMethod()
         return Fp8BlockLinearMethod(self, prefix=prefix)
+
+    def get_moe_method(self, prefix: str):
+        if self.is_layer_skipped(prefix):
+            return UnquantizedMoeMethod()
+        return Fp8BlockMoeMethod(self, prefix=prefix)

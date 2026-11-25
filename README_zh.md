@@ -57,6 +57,7 @@ CUDA_VISIBLE_DEVICES=0,1 kavor serve Mistral-7B-Instruct-v0.2 \
 | Mistral         | [Mistral-7B-Instruct-v0.2](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2)     | 
 | ERNIE 4.5         | [ERNIE-4.5-0.3B-PT](https://huggingface.co/baidu/ERNIE-4.5-0.3B-PT)     |
 | Ouro         | [Ouro-1.4B](https://huggingface.co/ByteDance/Ouro-1.4B), [Ouro-1.4B-Thinking](https://huggingface.co/ByteDance/Ouro-1.4B-Thinking), [Ouro-2.6B](https://huggingface.co/ByteDance/Ouro-2.6B), [Ouro-2.6B-Thinking](https://huggingface.co/ByteDance/Ouro-2.6B-Thinking)     |
+| Qwen3.5 / Qwen3.6 MoE | 35B-A3B(bf16 与 FP8 blockwise 版本),支持 TP、CUDA graph 与图文/视频输入 |
 
 ## 性能测试
 

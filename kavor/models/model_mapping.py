@@ -11,6 +11,7 @@ MODEL_MAPPING_NAMES = OrderedDict(
         ("qwen3_5", "Qwen3_5ForCausalLM"),
         ("qwen3_vl", "Qwen3VLForCausalLM"),
         ("mistral", "MistralForCausalLM"),
+        ("qwen3_5_moe", "Qwen3_5MoeForCausalLM")
     ]
 )
 

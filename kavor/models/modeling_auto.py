@@ -48,7 +48,7 @@ class AutoModelForCausalLM:
                 method.prepare_kernel(module)
                 prepared += 1
         if prepared:
-            logger.info("已为 %d 个 FP8 线性层准备 kernel", prepared)
+            logger.info("已为 %d 个量化层准备 kernel", prepared)
 
     @classmethod
     def _get_model_class(
@@ -86,6 +86,14 @@ class AutoModelForCausalLM:
             if weight_name.startswith(ignore_prefixes):
                 skipped.append((weight_name, loaded_weight.numel() * loaded_weight.element_size()))
                 continue
+            # per-expert 权重(checkpoint 按专家分散)拼进堆叠 3D 参数:模型自己声明
+            # 解析函数,返回已写入的参数全名;没有声明或没匹配上的走默认路径
+            resolve_stacked = getattr(model, "resolve_stacked_weight", None)
+            if resolve_stacked is not None:
+                stacked_name = resolve_stacked(weight_name, loaded_weight)
+                if stacked_name is not None:
+                    loaded.add(stacked_name)
+                    continue
             for k in packed_modules_mapping:
                 if k in weight_name:
                     v, shard_id = packed_modules_mapping[k]
