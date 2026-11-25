@@ -6,19 +6,22 @@
 需要 GPU;无 CUDA 时整文件跳过。
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
-from types import SimpleNamespace
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 
 import kavor.kernels.fp8.flashinfer as fp8_flashinfer  # noqa: E402
-from kavor.kernels.fp8.triton_w8a16 import fp8_blockwise_linear  # noqa: E402
 from kavor.kernels.fp8.triton_w8a8 import (  # noqa: E402
-    per_token_group_quant_fp8, w8a8_block_fp8_linear, w8a8_block_fp8_matmul)
-from kavor.layers.quant.fp8 import (  # noqa: E402
-    Fp8BlockLinearMethod, Fp8Config)
+    per_token_group_quant_fp8,
+    w8a8_block_fp8_linear,
+    w8a8_block_fp8_matmul,
+)
+from kavor.kernels.fp8.triton_w8a16 import fp8_blockwise_linear  # noqa: E402
+from kavor.layers.quant.fp8 import Fp8BlockLinearMethod, Fp8Config  # noqa: E402
 
 DEV = "cuda"
 FP8 = torch.float8_e4m3fn

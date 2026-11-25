@@ -1,6 +1,6 @@
 import torch
-from torch import nn
 import torch.distributed as dist
+from torch import nn
 
 from kavor.layers.quant.base import BlockQuantScaleParameter, UnquantizedLinearMethod
 

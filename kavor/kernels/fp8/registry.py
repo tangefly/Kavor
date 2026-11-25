@@ -27,8 +27,8 @@ import torch
 
 import kavor.kernels.fp8.flashinfer as fp8_flashinfer
 from kavor.kernels.fp8.marlin import MarlinKernel
-from kavor.kernels.fp8.triton_w8a16 import fp8_blockwise_linear
 from kavor.kernels.fp8.triton_w8a8 import w8a8_block_fp8_linear
+from kavor.kernels.fp8.triton_w8a16 import fp8_blockwise_linear
 from kavor.utils.logger import logger
 
 BACKENDS = ("auto", "flashinfer", "marlin", "triton_w8a16", "triton_w8a8")

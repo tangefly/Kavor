@@ -2,7 +2,6 @@ from collections import OrderedDict
 
 from .auto_factory import _LazyTypeMapping
 
-
 MODEL_MAPPING_NAMES = OrderedDict(
     [
         ("qwen3", "Qwen3ForCausalLM"),

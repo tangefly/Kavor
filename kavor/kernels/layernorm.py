@@ -1,8 +1,8 @@
 import torch
 import torch.nn.functional as F
-from torch import nn
 import triton
 import triton.language as tl
+from torch import nn
 
 
 @triton.jit

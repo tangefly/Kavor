@@ -1,7 +1,8 @@
 
-from collections import OrderedDict
 import importlib
+from collections import OrderedDict
 from typing import Any
+
 
 class _LazyTypeMapping(OrderedDict):
     """

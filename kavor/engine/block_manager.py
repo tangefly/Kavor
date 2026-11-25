@@ -1,5 +1,6 @@
+import hashlib
+import pickle
 from collections import deque
-import pickle, hashlib
 
 from kavor.engine.sequence import Sequence
 from kavor.utils.logger import logger

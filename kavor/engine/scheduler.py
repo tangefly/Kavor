@@ -1,8 +1,8 @@
 from collections import deque
 
 from kavor.config import Config
-from kavor.engine.sequence import Sequence, SequenceStatus
 from kavor.engine.block_manager import BlockManager
+from kavor.engine.sequence import Sequence, SequenceStatus
 
 
 class Scheduler:

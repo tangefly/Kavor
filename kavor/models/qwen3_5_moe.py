@@ -15,9 +15,9 @@ checkpoint 的专家是**按专家分散的 2D fp8 权重**
 import re
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-import torch.distributed as dist
 
 from kavor.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from kavor.layers.linear import ReplicatedLinear

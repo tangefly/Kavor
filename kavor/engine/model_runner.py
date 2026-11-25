@@ -1,20 +1,20 @@
 import pickle
+from multiprocessing.shared_memory import SharedMemory
+from multiprocessing.synchronize import Event
 
 import torch
 import torch.distributed as dist
-from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
 from tqdm.auto import tqdm
 
 from kavor.config import Config
 from kavor.engine.cache_pool import CachePool
-from kavor.engine.mm_cache import MMCache
 from kavor.engine.mm_assembler import MMInputAssembler
+from kavor.engine.mm_cache import MMCache
 from kavor.engine.sequence import Sequence
 from kavor.kernels.sampler import Sampler
-from kavor.utils.context import set_context, get_context, reset_context
-from kavor.utils.logger import logger
 from kavor.models import AutoModelForCausalLM
+from kavor.utils.context import get_context, reset_context, set_context
+from kavor.utils.logger import logger
 
 
 class ModelRunner:

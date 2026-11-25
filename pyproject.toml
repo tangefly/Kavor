@@ -27,3 +27,12 @@ kavor = "kavor.interface.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["kavor*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["I"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true

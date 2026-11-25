@@ -1,49 +1,11 @@
 import itertools
 from collections.abc import Callable
-import torch.nn.functional as F
 
 import torch
-from torch import nn
 import torch.distributed as dist
-
-from kavor.kernels.activation import SiluAndMul
-from kavor.kernels.attention.flash_attention_kvcache import Attention
-
-try:
-    from fla.ops.gated_delta_rule import (
-        fused_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
-        chunk_gated_delta_rule,
-    )
-    _HAS_FLA = True
-except ImportError:
-    from kavor.kernels.attention.gated_delta_rule import (
-        torch_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
-        torch_chunk_gated_delta_rule as chunk_gated_delta_rule
-    )
-    _HAS_FLA = False
-    from kavor.utils.logger import logger
-    logger.warning(
-        "未安装 flash-linear-attention,线性注意力 prefill 回退到纯 torch 实现"
-        "(慢 1.6x 左右):pip install 'flash-linear-attention[cuda]'")
-
-from kavor.kernels.attention.gated_delta_rule import fused_recurrent_gdn_decode
-from kavor.kernels.attention.causal_conv1d import (
-    causal_conv1d_update_inplace,
-    varlen_causal_conv1d,
-)
-
-from kavor.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-from kavor.kernels.layernorm import RMSNorm, RMSNormGated, rmsnorm_gemma
-from kavor.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from kavor.kernels.rotary_embedding import apply_mrope_partial
-from kavor.utils.context import get_context
-from kavor.utils.mm_plan import plan_shards, visible_row_index
-
+import torch.nn.functional as F
+from torch import nn
+from transformers import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.activations import ACT2FN
 from transformers.utils import torch_compilable_check
 from transformers.utils.generic import (
@@ -56,7 +18,42 @@ from transformers.vision_utils import (
     get_vision_interpolation_indices_and_weights,
     get_vision_position_ids,
 )
-from transformers import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
+
+from kavor.kernels.activation import SiluAndMul
+from kavor.kernels.attention.causal_conv1d import (
+    causal_conv1d_update_inplace,
+    varlen_causal_conv1d,
+)
+from kavor.kernels.attention.flash_attention_kvcache import Attention
+from kavor.kernels.attention.gated_delta_rule import fused_recurrent_gdn_decode
+from kavor.kernels.layernorm import RMSNorm, RMSNormGated, rmsnorm_gemma
+from kavor.kernels.rotary_embedding import apply_mrope_partial
+from kavor.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
+from kavor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from kavor.utils.context import get_context
+from kavor.utils.mm_plan import plan_shards, visible_row_index
+
+try:
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule,
+        fused_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
+    )
+    _HAS_FLA = True
+except ImportError:
+    from kavor.kernels.attention.gated_delta_rule import (
+        torch_chunk_gated_delta_rule as chunk_gated_delta_rule,
+        torch_recurrent_gated_delta_rule as recurrent_gated_delta_rule,
+    )
+    _HAS_FLA = False
+    from kavor.utils.logger import logger
+    logger.warning(
+        "未安装 flash-linear-attention,线性注意力 prefill 回退到纯 torch 实现"
+        "(慢 1.6x 左右):pip install 'flash-linear-attention[cuda]'")
 
 
 class Qwen3_5VisionRotaryEmbedding(nn.Module):

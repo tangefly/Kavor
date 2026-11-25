@@ -1,6 +1,6 @@
-from pydantic import BaseModel
 from typing import Any, Literal
-from pydantic import BaseModel, Field, ConfigDict
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GenerateRequest(BaseModel):

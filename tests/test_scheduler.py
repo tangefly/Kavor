@@ -6,8 +6,8 @@
 
 import pytest
 
-from kavor.engine.sequence import SequenceStatus
 from kavor.engine.scheduler import Scheduler
+from kavor.engine.sequence import SequenceStatus
 
 THINK_TOKEN = 248068   # Qwen3.5 的 <think>:现在只是普通 token,不再触发任何快照
 

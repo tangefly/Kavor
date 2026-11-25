@@ -1,8 +1,9 @@
 from functools import lru_cache
+
 import torch
-from torch import nn
 import triton
 import triton.language as tl
+from torch import nn
 
 
 @triton.jit

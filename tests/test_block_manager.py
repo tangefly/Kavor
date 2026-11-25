@@ -5,7 +5,7 @@
 
 import pytest
 
-from kavor.engine.block_manager import BlockManager, NONE_HASH
+from kavor.engine.block_manager import NONE_HASH, BlockManager
 
 TEST_BLOCK_SIZE = 4
 

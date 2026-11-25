@@ -14,7 +14,6 @@ import urllib.request
 import numpy as np
 from PIL import Image
 
-
 MAX_IMAGE_BYTES = 32 * 2**20
 MAX_VIDEO_BYTES = 64 * 2**20
 

@@ -5,7 +5,6 @@ from inspect import signature
 
 import torch
 
-
 CONFIG_REGISTRY: dict[str, type] = {}
 
 _DTYPE_MAP = {

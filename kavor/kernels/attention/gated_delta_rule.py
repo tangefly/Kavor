@@ -1,9 +1,10 @@
 import torch
-from transformers.utils import is_torchdynamo_exporting
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
+from transformers.utils import is_torchdynamo_exporting
+
 
 # NOTE: The FLA package computes `x / torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)` instead, so if we align
 # with the GatedRMSNorm, maybe we can make that change as well.

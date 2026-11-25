@@ -8,9 +8,8 @@ dequant oracle 比较 Frobenius 相对误差。
 首次运行需要 JIT 编译 Marlin(几十秒),之后命中缓存。
 """
 
-from types import SimpleNamespace
-
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch

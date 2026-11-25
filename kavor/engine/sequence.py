@@ -5,6 +5,7 @@ from itertools import count
 from time import perf_counter
 
 from kavor.sampling_params import SamplingParams
+
 from .multimodal import PromptInputs
 
 
