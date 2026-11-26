@@ -39,7 +39,7 @@ pip install -e .
 
 1. 探测目标环境的 `torch`，并读取本机 `nvcc` 与驱动版本；
 2. 把 `torch` 固定为 2.14.1，并选对应的 CUDA 构建（`cu126` / `cu130`）——`nvcc` 优先，驱动版本作为硬上限；
-3. 安装 `flash-attn`：[Kavor release](https://github.com/tangefly/Kavor/releases) 上有可用的 wheel 就直接用；没有就在同一次执行里拉取 `v2.8.3.post2` 版本的 `flash-attention` 仓库现场编译（10–30 分钟，产物缓存在 `~/.cache/kavor/wheels`）。
+3. 安装 `flash-attn`：[Kavor release](https://github.com/tangefly/Kavor/releases) 上有可用的 wheel 就直接用；没有就现场编译 `v2.8.3.post2` 版本的 `flash-attention`（10–30 分钟）。
 
 全新环境下脚本会先自己装好 `torch` 再编译，所以一条 `pip install -e .` 就够。
 
@@ -52,7 +52,7 @@ KAVOR_INSTALL_FLASH_ATTN=0 pip install -e .   # 不装 flash-attn(pip download�
 | --- | --- | --- |
 | `KAVOR_TORCH_CUDA` | `auto`（默认）/ `cu126` / `cu130` / `none` | 强制或跳过程序对 PyTorch CUDA 构建的选择 |
 | `KAVOR_INSTALL_FLASH_ATTN` | `1`（默认）/ `0` | 是否安装 `flash-attn` |
-| `KAVOR_WHEEL_CACHE` | 路径 | 现场编译产物的缓存目录（默认 `~/.cache/kavor/wheels`） |
+| `KAVOR_WHEEL_CACHE` | 路径 | 现场编译产物的缓存目录（默认 `<仓库>/.cache/wheels`） |
 
 测试与压测依赖按需安装：
 

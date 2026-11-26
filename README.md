@@ -39,7 +39,7 @@ One command installs everything. During the build, the script:
 
 1. probes the target environment for `torch` and reads `nvcc` plus the driver version;
 2. pins `torch` to 2.14.1 with the matching CUDA build (`cu126` or `cu130`) — `nvcc` wins and the driver version is a hard upper bound;
-3. installs `flash-attn`: a usable wheel on the [Kavor release](https://github.com/tangefly/Kavor/releases) is used as is; otherwise the `flash-attention` repository at `v2.8.3.post2` is pulled and compiled in the same run (10–30 min, the wheel is cached in `~/.cache/kavor/wheels`).
+3. installs `flash-attn`: a usable wheel on the [Kavor release](https://github.com/tangefly/Kavor/releases) is used as is; otherwise the `flash-attention` repository at `v2.8.3.post2` is compiled on the spot (10–30 min).
 
 In a brand-new environment the script installs `torch` itself before compiling, so a single `pip install -e .` is enough.
 
@@ -52,7 +52,7 @@ KAVOR_INSTALL_FLASH_ATTN=0 pip install -e .   # leave flash-attn out (pip downlo
 | --- | --- | --- |
 | `KAVOR_TORCH_CUDA` | `auto` (default) / `cu126` / `cu130` / `none` | Force or skip the PyTorch CUDA build selection |
 | `KAVOR_INSTALL_FLASH_ATTN` | `1` (default) / `0` | Whether `flash-attn` is installed |
-| `KAVOR_WHEEL_CACHE` | path | Where locally compiled wheels are cached (default `~/.cache/kavor/wheels`) |
+| `KAVOR_WHEEL_CACHE` | path | Where locally compiled wheels are cached (default `<checkout>/.cache/wheels`) |
 
 Test and benchmark dependencies are optional:
 

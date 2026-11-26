@@ -2,10 +2,11 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -19,6 +20,8 @@ PYTORCH_INDEX = "https://download.pytorch.org/whl"
 FLASH_ATTN_VERSION = "2.8.3.post2"
 FLASH_ATTN_REPO = "https://github.com/Dao-AILab/flash-attention"
 KAVOR_RELEASES = "https://api.github.com/repos/tangefly/Kavor/releases"
+REPO_ROOT = Path(__file__).resolve().parent
+GIT_TIMEOUT = 60  # a clone still running after 1 minute is a dead connection
 
 # Set KAVOR_INSTALL_FLASH_ATTN=0 to leave flash-attn out of the install.
 INSTALL_FLASH_ATTN = os.environ.get("KAVOR_INSTALL_FLASH_ATTN", "1").strip().lower() not in (
@@ -103,15 +106,28 @@ def run(cmd, env=None, cwd=None, timeout=None):
         return ""
 
 
-def show(cmd, env=None, cwd=None):
+def show(cmd, env=None, cwd=None, timeout=None):
     """Run a command with its output sent to the terminal; returns the exit code."""
     try:
-        with open("/dev/tty", "w") as tty:
-            return subprocess.run(
-                cmd, env=env, cwd=cwd, stdout=tty, stderr=subprocess.STDOUT
-            ).returncode
+        tty = open("/dev/tty", "w")
     except OSError:  # no terminal to write to
-        return subprocess.run(cmd, env=env, cwd=cwd).returncode
+        tty = None
+    redirections = {"stdout": tty, "stderr": subprocess.STDOUT} if tty else {}
+    try:
+        done = subprocess.run(cmd, env=env, cwd=cwd, timeout=timeout, **redirections)
+        return done.returncode
+    except subprocess.TimeoutExpired:
+        log(f"timed out after {timeout}s: {shlex.join(cmd)}")
+        return -1
+    finally:
+        if tty:
+            tty.close()
+
+
+def git_fetch(args, env, what):
+    """Run a `git` network command once and return; raises when it fails."""
+    if show(["git", *args], env=env, timeout=GIT_TIMEOUT) != 0:
+        raise RuntimeError(f"{what} failed")
 
 
 def pip_install(*args):
@@ -203,10 +219,19 @@ def flash_attn_matches(version, cu_major):
 
 
 def wheel_cache_dir():
+    """Where built wheels and this run's requirements memo live.
+
+    Defaults to the checkout's own .cache (git-ignored), so a wheel stays next to the
+    source it was built from instead of in a global cache the user cannot find.
+    """
     if os.environ.get("KAVOR_WHEEL_CACHE"):
         return Path(os.environ["KAVOR_WHEEL_CACHE"]).expanduser()
-    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
-    return Path(base) / "kavor" / "wheels"
+    return REPO_ROOT / ".cache" / "wheels"
+
+
+def source_dir():
+    """The flash-attention checkout the build compiles from; reused across runs."""
+    return wheel_cache_dir() / "src" / f"flash-attention-v{FLASH_ATTN_VERSION}"
 
 
 def wheel_pattern(cu_major, abi):
@@ -224,10 +249,14 @@ def release_wheel(cu_major, abi):
     try:
         with urllib.request.urlopen(KAVOR_RELEASES, timeout=30) as response:
             releases = json.load(response)
-    except (OSError, ValueError, KeyError) as exc:
+        urls = [
+            asset["browser_download_url"]
+            for release in releases
+            for asset in release["assets"]
+        ]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         log(f"could not list the wheels on the Kavor release ({exc})")
         return None
-    urls = [asset["browser_download_url"] for release in releases for asset in release["assets"]]
     return next((url for url in urls if wheel_pattern(cu_major, abi).search(url)), None)
 
 
@@ -249,6 +278,26 @@ def max_jobs():
     except (OSError, AttributeError):
         pass
     return max(1, min(os.cpu_count() or 4, int(available_gb // 9) or 1, 8))
+
+
+# flash-attn reads its own arch knob and ignores TORCH_CUDA_ARCH_LIST; it only knows
+# sm_80/90/100/120, and an sm_80 build runs on every 8.x card.
+CUDA_ARCHS = {"8": "80", "9": "90", "10": "100", "12": "120"}
+
+
+def flash_attn_archs(capability):
+    """The flash-attn arch name for this GPU, or None to keep the upstream default."""
+    return CUDA_ARCHS.get((capability or "").split(".")[0])
+
+
+def patch_cxx_std(src):
+    """flash-attn 2.8.3.post2 hardcodes -std=c++17, which the pinned torch headers reject."""
+    setup_py = src / "setup.py"
+    text = setup_py.read_text()
+    if '"-std=c++17"' not in text:
+        return
+    setup_py.write_text(text.replace('"-std=c++17"', '"-std=c++20"'))
+    log("building flash-attn with -std=c++20 (torch 2.14 requires C++20)")
 
 
 def compile_flash_attn(torch_req):
@@ -280,8 +329,9 @@ def compile_flash_attn(torch_req):
             ),
         }
     )
-    if capability:
-        env["TORCH_CUDA_ARCH_LIST"] = capability
+    archs = flash_attn_archs(capability)
+    if archs:
+        env["FLASH_ATTN_CUDA_ARCHS"] = archs
 
     dest = wheel_cache_dir()
     dest.mkdir(parents=True, exist_ok=True)
@@ -291,15 +341,22 @@ def compile_flash_attn(torch_req):
     )
     log(
         f"MAX_JOBS={env['MAX_JOBS']} NVCC_THREADS={env['NVCC_THREADS']} "
-        f"TORCH_CUDA_ARCH_LIST={capability or 'not set'}"
+        f"FLASH_ATTN_CUDA_ARCHS={archs or 'upstream default'}"
     )
 
-    pip_install("setuptools", "wheel", "ninja", "packaging", "psutil")
-    with tempfile.TemporaryDirectory(prefix="kavor-flash-attn-") as tmp:
-        repo = str(Path(tmp) / "flash-attention")
-        for cmd in (
+    if not pip_install("setuptools", "wheel", "ninja", "packaging", "psutil"):
+        raise RuntimeError("could not install the flash-attn build requirements")
+
+    src = source_dir()
+    repo = str(src)
+    if (src / ".git").is_dir() and (src / "setup.py").is_file():
+        log(f"reusing the flash-attention checkout in {src}")
+    else:
+        # A clone that never finished is not a checkout; start over from a clean path.
+        shutil.rmtree(src, ignore_errors=True)
+        src.parent.mkdir(parents=True, exist_ok=True)
+        git_fetch(
             [
-                "git",
                 "clone",
                 "--depth",
                 "1",
@@ -308,26 +365,33 @@ def compile_flash_attn(torch_req):
                 FLASH_ATTN_REPO,
                 repo,
             ],
-            ["git", "-C", repo, "submodule", "update", "--init", "csrc/cutlass"],
-        ):
-            if show(cmd, env=env):
-                raise RuntimeError("could not fetch the flash-attention repository")
-
-        # --no-build-isolation builds against the target environment's torch.
-        show(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "wheel",
-                repo,
-                "--no-build-isolation",
-                "--no-deps",
-                "--wheel-dir",
-                str(dest),
-            ],
-            env=env,
+            env,
+            "cloning flash-attention",
         )
+    # The kernels are compiled against the cutlass checkout pinned by the tag.
+    if not (src / "csrc" / "cutlass" / "include").is_dir():
+        git_fetch(
+            ["-C", repo, "submodule", "update", "--init", "csrc/cutlass"],
+            env,
+            "fetching csrc/cutlass",
+        )
+    patch_cxx_std(src)
+
+    # --no-build-isolation builds against the target environment's torch.
+    show(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            repo,
+            "--no-build-isolation",
+            "--no-deps",
+            "--wheel-dir",
+            str(dest),
+        ],
+        env=env,
+    )
 
     wheel = cached_wheel(cu_major, abi)
     if wheel is None:
@@ -336,28 +400,19 @@ def compile_flash_attn(torch_req):
 
 
 def build_flash_attn(torch_req):
-    """Build flash-attn; returns the wheel's URL, or None when it fails.
+    """Build flash-attn and return the wheel's URL.
 
-    pip runs this script up to three times per install, so a failed build is remembered
-    for the rest of that run instead of being started over.
+    Every model module imports flash_attn at import time, so ending an install without it
+    only moves the failure to the first model load; fail here instead of silently
+    shipping a broken environment (KAVOR_INSTALL_FLASH_ATTN=0 is the way to skip it).
     """
-    cache = wheel_cache_dir()
-    cache.mkdir(parents=True, exist_ok=True)
-    marker = cache / f"build-failed-{os.getppid()}"
-    for stale in cache.glob("build-failed-*"):
-        if stale != marker:
-            stale.unlink()
-    if marker.exists():
-        log("an earlier attempt to build flash-attn failed in this pip run, skipping it")
-        return None
-
     try:
         wheel = compile_flash_attn(torch_req)
-    except Exception as exc:  # a failed build must not take the whole install down
-        marker.touch()
-        log(f"building flash-attn failed: {exc}")
-        log("fix the cause and run pip install -e . again")
-        return None
+    except Exception as exc:
+        raise RuntimeError(
+            f"flash-attn could not be built: {exc}. Fix the cause and run pip install "
+            "-e . again, or set KAVOR_INSTALL_FLASH_ATTN=0 to install without it"
+        ) from exc
     log(f"flash-attn built: {wheel}")
     return wheel
 
@@ -386,12 +441,38 @@ def flash_attn_requirement(variant, torch_req):
     url = release_wheel(cu_major, abi) or cached_wheel(cu_major, abi)
     if url is None:
         url = build_flash_attn(torch_req)
-        if url is None:
-            return None
     return f"flash-attn @ {url}"
 
 
+# Only a running pip resolves requirements, and no single run lasts this long.
+REQUIREMENTS_MEMO_AGE = 6 * 3600
+
+
+def requirements_memo():
+    """File that carries this pip run's requirements to its later invocations."""
+    return wheel_cache_dir() / f"requirements-{os.getppid()}.json"
+
+
 def get_requirements():
+    """install_requires, resolved once per pip run."""
+    memo = requirements_memo()
+    try:
+        if time.time() - memo.stat().st_mtime < REQUIREMENTS_MEMO_AGE:
+            return json.loads(memo.read_text())
+    except (OSError, ValueError):
+        pass
+
+    requirements = resolve_requirements()
+    try:
+        memo.parent.mkdir(parents=True, exist_ok=True)
+        memo.write_text(json.dumps(requirements))
+    except OSError:
+        pass
+    return requirements
+
+
+def resolve_requirements():
+    """Pick the torch build and the flash-attn source this machine can use."""
     variant, notes = resolve_variant(
         nvcc_major(), driver_major(), os.environ.get("KAVOR_TORCH_CUDA", "auto")
     )
