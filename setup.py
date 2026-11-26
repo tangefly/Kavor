@@ -2,384 +2,421 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.request
+from pathlib import Path
 
 from setuptools import setup
 
+TORCH_VERSION = "2.14.1"
+TORCH_MINOR = ".".join(TORCH_VERSION.split(".")[:2])
+TORCHVISION_VERSION = "0.29.1"
+PYTORCH_INDEX = "https://download.pytorch.org/whl"
+
 FLASH_ATTN_VERSION = "2.8.3.post2"
-FLASH_ATTN_PYTHONS = ("cp312",)
-WHEEL_BASE_URL = os.environ.get(
-    "KAVOR_WHEEL_BASE",
-    "https://github.com/tangefly/Kavor/releases/download/wheels-v1",
+FLASH_ATTN_REPO = "https://github.com/Dao-AILab/flash-attention"
+KAVOR_RELEASES = "https://api.github.com/repos/tangefly/Kavor/releases"
+
+# Set KAVOR_INSTALL_FLASH_ATTN=0 to leave flash-attn out of the install.
+INSTALL_FLASH_ATTN = os.environ.get("KAVOR_INSTALL_FLASH_ATTN", "1").strip().lower() not in (
+    "0", "false", "no", "off"
 )
-TORCH_VARIANTS = {
-    "cu126": {
-        "torch": "2.9.1",
-        "cuda": "12.6",
-        "abi": True,
-        "index": "https://download.pytorch.org/whl/cu126",
-        "wheel": "torch-2.9.1%2Bcu126-{py}-{py}-manylinux_2_28_x86_64.whl",
-        "driver_cuda_min": 12,
-        "flash_attn_version": "2.8.3.post2",
-        "flash_attn_local": "cu126torch2.9cxx11abitrue",
-    },
-    "cu130": {
-        "torch": "2.9.1",
-        "cuda": "13.0",
-        "abi": True,
-        "index": "https://download.pytorch.org/whl/cu130",
-        "wheel": "torch-2.9.1%2Bcu130-{py}-{py}-manylinux_2_28_x86_64.whl",
-        "driver_cuda_min": 13,
-        "flash_attn_version": "2.8.3.post2",
-        "flash_attn_local": "cu13torch2.9cxx11abitrue",
-    },
-}
-DEFAULT_VARIANT = "cu130"
-TORCH_SPEC = "torch>=2.9,<2.10"
+
+# torch CUDA build -> CUDA major, which is also the lowest one the driver must support.
+CUDA_VARIANTS = {"cu126": 12, "cu130": 13}
+DEFAULT_VARIANT = "cu126"  # runs on the oldest drivers
+
 BASE_REQUIREMENTS = [
-    "triton>=3.0.0",
-    "transformers>=4.51.0",
-    "xxhash",
-    "fastapi",
-    "uvicorn",
-    "flash-linear-attention[cuda]"
+    "triton>=3.3",
+    "transformers==5.17.0",
+    "numpy>=1.26,<3",
+    "pillow>=10.0.1",
+    "safetensors>=0.8.0",
+    "tqdm>=4.66",
+    "pydantic>=2.6",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "einops>=0.8",
+    "flash-linear-attention[cuda]==0.6.0",
 ]
-_PROBE = (
-    "import json, torch; print(json.dumps({"
-    "'version': torch.__version__,"
-    "'cuda': torch.version.cuda,"
-    "'abi': bool(torch._C._GLIBCXX_USE_CXX11_ABI)}))"
+
+ARCH = platform.machine()
+CP = f"cp{sys.version_info.major}{sys.version_info.minor}"
+WHEEL_SUFFIX = f"-{CP}-{CP}-manylinux_2_28_{ARCH}.whl"
+PREBUILT_TORCH = sys.platform.startswith("linux") and ARCH in ("x86_64", "aarch64")
+
+# One JSON line per step, so a later crash (e.g. a broken flash-attn .so) keeps the earlier results.
+TARGET_PROBE = """
+import json
+try:
+    import torch
+except BaseException:
+    pass
+else:
+    print(json.dumps({"torch": {"version": torch.__version__, "cuda": torch.version.cuda,
+                               "abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI)}}), flush=True)
+try:
+    import flash_attn
+except BaseException:
+    pass
+else:
+    print(json.dumps({"flash_attn": flash_attn.__version__}), flush=True)
+"""
+GPU_PROBE = (
+    "import json, torch; "
+    "print(json.dumps({'capability': '%d.%d' % torch.cuda.get_device_capability()}))"
 )
-_FLASH_ATTN_PROBE = (
-    "import json\n"
-    "try:\n"
-    "    import flash_attn\n"
-    "except Exception as exc:\n"
-    "    print(json.dumps({'error': type(exc).__name__}))\n"
-    "else:\n"
-    "    print(json.dumps({'version': flash_attn.__version__}))\n"
-)
-
-_probe_cache = None
-_probe_python = None
-_flash_attn_probe_cache = None
 
 
-def _run_probe(python, code):
-    """借目标环境的解释器跑一段探测脚本,返回最后一行 JSON;失败返回 None。"""
+def log(message):
+    """Print straight to the terminal, because pip hides most of the build output."""
+    line = f"[kavor] {message}"
     try:
-        # pip 的构建隔离会把 PYTHONPATH 指向它自己的 site 目录,
-        # 那里的 sitecustomize.py 会把目标环境的 site-packages 从
-        # sys.path 里删掉。这里必须清掉,否则连目标环境的 torch 也 import 不到。
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k not in ("PYTHONPATH", "PYTHONHOME")
-        }
-        done = subprocess.run(
-            [python, "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=env,
-        )
-    except Exception:
-        return None
-    if done.returncode != 0 or not done.stdout.strip():
-        return None
-    try:
-        return json.loads(done.stdout.strip().splitlines()[-1])
-    except ValueError:
-        return None
+        with open("/dev/tty", "w") as tty:
+            print(line, file=tty, flush=True)
+    except OSError:
+        print(line, file=sys.stderr, flush=True)
 
 
-def probe_target_torch():
-    """探测目标环境(真正要跑 kavor 的那个环境)里的 torch,返回 dict 或 None。
+def target_env(extra=None):
+    """Environment for subprocesses that must see the target environment's packages.
 
-    pip 默认在隔离的构建环境里跑本文件,那里没有 torch;
-    但 CONDA_PREFIX / VIRTUAL_ENV 会原样传进来,所以借目标环境的解释器
-    跑一次探测最准,也不用往构建依赖里塞一整个 torch。
+    Build isolation points PYTHONPATH at pip's own overlay, which hides them.
     """
-    global _probe_cache, _probe_python
-    if _probe_cache is not None:
-        return _probe_cache
+    blocked = ("PYTHONPATH", "PYTHONHOME", "PYTHONNOUSERSITE", "PYTHONSTARTUP")
+    env = {key: value for key, value in os.environ.items() if key not in blocked}
+    env.update(extra or {})
+    return env
 
-    # 没有构建隔离(pip install -e . --no-build-isolation)时可以直接 import
+
+def run(cmd, env=None, cwd=None, timeout=None):
+    """Run a command quietly and return its stdout, or '' when it cannot run."""
     try:
-        import torch
-    except ImportError:
-        pass
-    else:
-        _probe_python = sys.executable
-        _probe_cache = {
-            "version": torch.__version__,
-            "cuda": torch.version.cuda,
-            "abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
-        }
-        return _probe_cache
+        done = subprocess.run(
+            cmd, env=env, cwd=cwd, capture_output=True, text=True, timeout=timeout
+        )
+        return done.stdout
+    except Exception:
+        return ""
 
-    for var in ("CONDA_PREFIX", "VIRTUAL_ENV"):
-        prefix = os.environ.get(var)
-        if not prefix:
-            continue
-        python = os.path.join(prefix, "bin", "python")
-        if not os.path.exists(python):
-            continue
-        result = _run_probe(python, _PROBE)
-        if result is None:
-            continue
-        _probe_python = python
-        _probe_cache = result
-        return _probe_cache
 
+def show(cmd, env=None, cwd=None):
+    """Run a command with its output sent to the terminal; returns the exit code."""
+    try:
+        with open("/dev/tty", "w") as tty:
+            return subprocess.run(
+                cmd, env=env, cwd=cwd, stdout=tty, stderr=subprocess.STDOUT
+            ).returncode
+    except OSError:  # no terminal to write to
+        return subprocess.run(cmd, env=env, cwd=cwd).returncode
+
+
+def pip_install(*args):
+    """Install into the target environment; returns True on success."""
+    return show([sys.executable, "-m", "pip", "install", *args], env=target_env()) == 0
+
+
+def probe_target(code=TARGET_PROBE):
+    """Run `code` with the target interpreter and merge the JSON lines it prints."""
+    found = {}
+    output = run([sys.executable, "-c", code], env=target_env(), timeout=120)
+    for line in output.splitlines():
+        try:
+            found.update(json.loads(line))
+        except ValueError:
+            pass
+    return found
+
+
+def nvcc_major():
+    """CUDA major version reported by nvcc, or None."""
+    home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    candidates = [os.path.join(home, "bin", "nvcc")] if home else []
+    if shutil.which("nvcc"):
+        candidates.append(shutil.which("nvcc"))
+    for nvcc in candidates:
+        match = re.search(r"release\s+(\d+)\.(\d+)", run([nvcc, "-V"], timeout=15))
+        if match:
+            return int(match.group(1))
     return None
 
 
-def probe_local_flash_attn():
-    """目标环境里已装且能 import 的 flash-attn 版本,没有返回 None。
+def driver_major():
+    """Highest CUDA major the NVIDIA driver supports, or None."""
+    match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", run(["nvidia-smi"], timeout=15))
+    return int(match.group(1)) if match else None
 
-    只认能 import 的:装了个 ABI 不匹配的 .so 时 import 会失败,
-    这种情况要继续走预编译 wheel 重装。
+
+def resolve_variant(nvcc, driver, forced):
+    """Pick the torch CUDA build; returns (variant or None, notes to log).
+
+    KAVOR_TORCH_CUDA wins over nvcc, and the driver is a hard upper bound.
     """
-    global _flash_attn_probe_cache
-    if _flash_attn_probe_cache is not None:
-        return _flash_attn_probe_cache
+    forced = forced.strip().lower()
+    if forced == "none":
+        return None, ["KAVOR_TORCH_CUDA=none: using the PyPI build of torch"]
+    if forced in CUDA_VARIANTS:
+        return forced, [f"KAVOR_TORCH_CUDA={forced}"]
 
-    if _probe_python is None:
-        return None
-
-    result = _run_probe(_probe_python, _FLASH_ATTN_PROBE)
-    if not result or result.get("error") or not result.get("version"):
-        return None
-    _flash_attn_probe_cache = result["version"]
-    return _flash_attn_probe_cache
-
-
-def detect_nvcc_cuda():
-    """nvcc -V 报告的本机 CUDA 版本(实际在用的那个),读不到返回 "13.0" 这样的字符串。"""
-    try:
-        done = subprocess.run(
-            ["nvcc", "-V"], capture_output=True, text=True, timeout=10
-        )
-    except Exception:
-        return None
-    out = (done.stdout or "") + (done.stderr or "")
-    # Cuda compilation tools, release 13.0, V13.0.88
-    m = re.search(r"release\s+(\d+)\.(\d+)", out)
-    return f"{m.group(1)}.{m.group(2)}" if m else None
-
-
-def detect_driver_cuda():
-    """nvidia-smi 报告的驱动支持的 CUDA 上限(不是实际在用的版本),读不到返回 None。"""
-    try:
-        done = subprocess.run(
-            ["nvidia-smi"], capture_output=True, text=True, timeout=10
-        )
-    except Exception:
-        return None
-    m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", done.stdout or "")
-    return int(m.group(1)) if m else None
-
-
-def auto_variant():
-    """auto 模式下按 nvcc 选变体,驱动版本只作为上限校验。
-
-    nvcc 的版本才是本机实际在用的 CUDA;驱动里的 "CUDA Version" 只是它
-    能支持到的最高版本。没装 nvcc 时退回默认变体。
-    """
-    toolkit = detect_nvcc_cuda()
-    if toolkit is None:
-        variant = DEFAULT_VARIANT
-    else:
-        major = int(toolkit.split(".")[0])
-        usable = [
-            key
-            for key, v in TORCH_VARIANTS.items()
-            if int(v["cuda"].split(".")[0]) <= major
+    notes = []
+    if forced != "auto":
+        notes.append(f"KAVOR_TORCH_CUDA={forced} is not a known variant, selecting automatically")
+    if nvcc is None and driver is None:
+        return DEFAULT_VARIANT, notes + [
+            f"neither nvcc nor a driver was detected, using {DEFAULT_VARIANT}"
         ]
-        if not usable:
-            print(
-                f"[kavor] nvcc 显示本机实际是 CUDA {toolkit},没有匹配的 torch 变体。\n"
-                "[kavor] 请先自己装好对应版本的 torch(比如 pip install torch "
-                "--index-url https://download.pytorch.org/whl/cu126),再 pip install -e ."
-            )
-            return None
-        variant = max(
-            usable,
-            key=lambda k: tuple(int(x) for x in TORCH_VARIANTS[k]["cuda"].split(".")),
+
+    allowed = [key for key, cuda in CUDA_VARIANTS.items() if driver is None or cuda <= driver]
+    if not allowed:
+        return None, notes + [f"the driver only supports CUDA {driver}.x, below every torch build"]
+
+    highest = max(allowed, key=lambda key: CUDA_VARIANTS[key])
+    chosen = next((key for key in allowed if CUDA_VARIANTS[key] == nvcc), highest)
+    if nvcc is None:
+        notes.append(f"nvcc not found, selecting {chosen} by the driver limit CUDA {driver}.x")
+    elif CUDA_VARIANTS[chosen] != nvcc:
+        notes.append(
+            f"nvcc is CUDA {nvcc}.x but {chosen} was selected; JIT kernels such as marlin "
+            "may fail to build and fall back to triton"
         )
-
-    v = TORCH_VARIANTS[variant]
-    driver = detect_driver_cuda()
-    if driver is not None and driver < v["driver_cuda_min"]:
-        print(
-            f"[kavor] 驱动只支持到 CUDA {driver}.x,装 {variant} 的 torch 跑不起来。\n"
-            "[kavor] 请先自己装好 torch(比如 pip install torch --index-url "
-            "https://download.pytorch.org/whl/cu126),再 pip install -e ."
-        )
-        return None
-    return variant
+    return chosen, notes
 
 
-def resolve_variant():
-    """按 nvcc 得到目标变体;KAVOR_TORCH_CUDA 可以显式覆盖。"""
-    variant = os.environ.get("KAVOR_TORCH_CUDA", "auto").lower()
-
-    if variant == "auto":
-        return auto_variant()
-
-    if variant not in TORCH_VARIANTS:
-        print(f"[kavor] KAVOR_TORCH_CUDA={variant},不替 pip 指定 torch")
-        return None
-
-    return variant
+def cuda_major(info):
+    """CUDA major of a probed torch, or None."""
+    return int(str((info or {}).get("cuda") or 0).split(".")[0]) or None
 
 
-def variant_info(v):
-    """变体表里的 torch 信息,格式和 probe_target_torch 的返回值一致。"""
-    return {"version": v["torch"], "cuda": v["cuda"], "abi": v["abi"]}
+def flash_attn_matches(version, cu_major):
+    """Whether an installed flash-attn was built for the pinned torch line and CUDA major.
 
-
-def same_cuda(info, v):
-    """已装 torch 的 CUDA 和变体是否一致(只比较 major.minor)。"""
-    installed = (info.get("cuda") or "").split(".")
-    wanted = v["cuda"].split(".")
-    return installed[:2] == wanted[:2]
-
-
-def torch_wheel_url(variant):
-    v = TORCH_VARIANTS[variant]
-    py = f"cp{sys.version_info.major}{sys.version_info.minor}"
-    return f"{v['index']}/{v['wheel'].format(py=py)}"
-
-
-def torch_requirement(info):
-    """决定 torch 这条依赖怎么写,以及按哪个 torch 选 flash-attn wheel。
-
-    nvcc 是唯一判据:它选出的变体和已装 torch 不一致时,按 nvcc 重装 torch。
-    返回 (依赖字符串, flash-attn 用的 torch 信息, 变体 key)。
+    A version without local tags cannot be told apart, so it counts as a match.
     """
-    variant = resolve_variant()
-    v = TORCH_VARIANTS[variant] if variant is not None else None
+    torch = re.search(r"torch(\d+\.\d+)", version)
+    cuda = re.search(r"cu(\d+)", version)
+    if torch and torch.group(1) != TORCH_MINOR:
+        return False
+    return cu_major is None or not cuda or int(cuda.group(1)[:2]) == cu_major
 
-    if v is not None and info is not None and same_cuda(info, v):
-        print(
-            f"[kavor] 目标环境 torch {info['version']} / CUDA {info['cuda']} "
-            f"与 nvcc 选出的 {variant} 一致"
+
+def wheel_cache_dir():
+    if os.environ.get("KAVOR_WHEEL_CACHE"):
+        return Path(os.environ["KAVOR_WHEEL_CACHE"]).expanduser()
+    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    return Path(base) / "kavor" / "wheels"
+
+
+def wheel_pattern(cu_major, abi):
+    """Matches a flash-attn wheel for this interpreter, the pinned torch line and the CUDA major,
+    whatever spelling the local tag uses (cu12 / cu126, cxx11abitrue / cxx11abiTRUE)."""
+    return re.compile(
+        rf"flash_attn-{re.escape(FLASH_ATTN_VERSION)}\+cu{cu_major}\d*torch{TORCH_MINOR}"
+        rf"cxx11abi{'true' if abi else 'false'}-{CP}-{CP}-linux_{ARCH}\.whl$",
+        re.IGNORECASE,
+    )
+
+
+def release_wheel(cu_major, abi):
+    """URL of a usable flash-attn wheel attached to the Kavor releases, or None."""
+    try:
+        with urllib.request.urlopen(KAVOR_RELEASES, timeout=30) as response:
+            releases = json.load(response)
+    except (OSError, ValueError, KeyError) as exc:
+        log(f"could not list the wheels on the Kavor release ({exc})")
+        return None
+    urls = [asset["browser_download_url"] for release in releases for asset in release["assets"]]
+    return next((url for url in urls if wheel_pattern(cu_major, abi).search(url)), None)
+
+
+def cached_wheel(cu_major, abi):
+    """URL of a flash-attn wheel built earlier on this machine, or None."""
+    pattern = wheel_pattern(cu_major, abi)
+    wheels = wheel_cache_dir().glob("*.whl")
+    return next((path.as_uri() for path in wheels if pattern.search(path.name)), None)
+
+
+def max_jobs():
+    """Parallel compile jobs: each nvcc process peaks at roughly 6-9 GB of memory."""
+    if os.environ.get("MAX_JOBS"):
+        return max(1, int(os.environ["MAX_JOBS"]))
+    available_gb = 32.0
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+        available_gb = int(re.search(r"MemAvailable:\s+(\d+)", meminfo).group(1)) / 1024**2
+    except (OSError, AttributeError):
+        pass
+    return max(1, min(os.cpu_count() or 4, int(available_gb // 9) or 1, 8))
+
+
+def compile_flash_attn(torch_req):
+    """Compile flash-attn from its repo and return the URL of the wheel, kept in the wheel cache."""
+    # pip installs torch only after this metadata step, but the build needs it right now.
+    if not pip_install(torch_req):
+        raise RuntimeError(f"could not install {torch_req}")
+    info = probe_target()["torch"]
+    cu_major, abi = cuda_major(info), bool(info.get("abi", True))
+
+    nvcc = nvcc_major()
+    if nvcc is None:
+        raise RuntimeError("nvcc not found, install the CUDA toolkit first")
+    if nvcc != cu_major:
+        log(
+            f"warning: nvcc is CUDA {nvcc}.x but torch uses CUDA {info['cuda']}; "
+            "the build may fail"
         )
-        return TORCH_SPEC, info, variant
 
-    if v is not None:
-        if sys.platform != "linux" or platform.machine() != "x86_64":
-            print("[kavor] 非 linux/x86_64,不替 pip 指定 torch")
-            return TORCH_SPEC, info, variant
+    capability = probe_target(GPU_PROBE).get("capability")
+    env = target_env(
+        {
+            "MAX_JOBS": str(max_jobs()),
+            "NVCC_THREADS": os.environ.get("NVCC_THREADS", "1"),
+            # Never swap in a wheel from the official flash-attn release.
+            "FLASH_ATTENTION_FORCE_BUILD": "TRUE",
+            "FLASH_ATTN_LOCAL_VERSION": (
+                f"cu{cu_major}torch{TORCH_MINOR}cxx11abi{'TRUE' if abi else 'FALSE'}"
+            ),
+        }
+    )
+    if capability:
+        env["TORCH_CUDA_ARCH_LIST"] = capability
 
-        if info is not None:
-            print(
-                f"[kavor] 目标环境 torch 是 CUDA {info['cuda']},"
-                f"与 nvcc 选出的 {variant} 不一致,按 nvcc 重装 torch"
-            )
-        else:
-            print(f"[kavor] 目标环境没有 torch,将装 {variant} 官方 wheel:")
-        print(f"        {torch_wheel_url(variant)}")
-        return f"torch @ {torch_wheel_url(variant)}", variant_info(v), variant
+    dest = wheel_cache_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    log(
+        f"building flash-attn {FLASH_ATTN_VERSION} ({CP}, CUDA {cu_major}); "
+        "the first build usually takes 10-30 minutes"
+    )
+    log(
+        f"MAX_JOBS={env['MAX_JOBS']} NVCC_THREADS={env['NVCC_THREADS']} "
+        f"TORCH_CUDA_ARCH_LIST={capability or 'not set'}"
+    )
 
-    # nvcc 没有给出变体:沿用已装 torch,没有就不指定具体版本
-    if info is not None:
-        # flash-attn 的版本是按变体定的,这里按已装 torch 的 CUDA 反查变体
-        for key, cv in TORCH_VARIANTS.items():
-            if same_cuda(info, cv):
-                variant = key
-                break
-    return TORCH_SPEC, info, variant
+    pip_install("setuptools", "wheel", "ninja", "packaging", "psutil")
+    with tempfile.TemporaryDirectory(prefix="kavor-flash-attn-") as tmp:
+        repo = str(Path(tmp) / "flash-attention")
+        for cmd in (
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                f"v{FLASH_ATTN_VERSION}",
+                FLASH_ATTN_REPO,
+                repo,
+            ],
+            ["git", "-C", repo, "submodule", "update", "--init", "csrc/cutlass"],
+        ):
+            if show(cmd, env=env):
+                raise RuntimeError("could not fetch the flash-attention repository")
+
+        # --no-build-isolation builds against the target environment's torch.
+        show(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "wheel",
+                repo,
+                "--no-build-isolation",
+                "--no-deps",
+                "--wheel-dir",
+                str(dest),
+            ],
+            env=env,
+        )
+
+    wheel = cached_wheel(cu_major, abi)
+    if wheel is None:
+        raise RuntimeError("no wheel was produced, see the compiler output above")
+    return wheel
 
 
-def flash_attn_requirement(info, variant=None):
-    """按探测结果拼出预编译 wheel 的直链,没有对应 wheel 时返回 None。"""
-    if not info or not info.get("cuda"):
+def build_flash_attn(torch_req):
+    """Build flash-attn; returns the wheel's URL, or None when it fails.
+
+    pip runs this script up to three times per install, so a failed build is remembered
+    for the rest of that run instead of being started over.
+    """
+    cache = wheel_cache_dir()
+    cache.mkdir(parents=True, exist_ok=True)
+    marker = cache / f"build-failed-{os.getppid()}"
+    for stale in cache.glob("build-failed-*"):
+        if stale != marker:
+            stale.unlink()
+    if marker.exists():
+        log("an earlier attempt to build flash-attn failed in this pip run, skipping it")
         return None
 
-    version = FLASH_ATTN_VERSION
-    local = None
-    if variant is not None and variant in TORCH_VARIANTS:
-        v = TORCH_VARIANTS[variant]
-        version = v.get("flash_attn_version", version)
-        local = v.get("flash_attn_local")
-
-    py = f"cp{sys.version_info.major}{sys.version_info.minor}"  # cp312
-    if py not in FLASH_ATTN_PYTHONS:
+    try:
+        wheel = compile_flash_attn(torch_req)
+    except Exception as exc:  # a failed build must not take the whole install down
+        marker.touch()
+        log(f"building flash-attn failed: {exc}")
+        log("fix the cause and run pip install -e . again")
         return None
-    if local is None:
-        cu = "cu" + info["cuda"].split(".")[0]  # 13.0 -> cu13
-        tv = "torch" + ".".join(info["version"].split("+")[0].split(".")[:2])  # 2.9.1 -> torch2.9
-        abi = "TRUE" if info["abi"] else "FALSE"
-        local = f"{cu}{tv}cxx11abi{abi}"
-    plat = f"linux_{platform.machine()}"  # linux_x86_64
-    wheel = f"flash_attn-{version}+{local}-{py}-{py}-{plat}.whl"
-    return f"flash-attn @ {WHEEL_BASE_URL}/{wheel}"
+    log(f"flash-attn built: {wheel}")
+    return wheel
+
+
+def flash_attn_requirement(variant, torch_req):
+    """Resolve flash-attn: already usable -> wheel on the Kavor release -> wheel built earlier
+    here -> build it now. Returns the requirement string, or None when flash-attn is left out.
+    """
+    probe = probe_target()
+    if variant is None:
+        # Without a variant the CUDA major only shows up once the pinned torch exists,
+        # and pip installs torch after this step.
+        pip_install(torch_req)
+        probe = probe_target()
+    info = probe.get("torch") or {}
+    cu_major, abi = CUDA_VARIANTS.get(variant) or cuda_major(info), bool(info.get("abi", True))
+
+    installed = probe.get("flash_attn")
+    if installed and flash_attn_matches(installed, cu_major):
+        log(f"flash-attn {installed} is already installed and usable, keeping it")
+        return None
+
+    if cu_major is None:
+        log("no CUDA torch to build flash-attn against, it is left out")
+        return None
+    url = release_wheel(cu_major, abi) or cached_wheel(cu_major, abi)
+    if url is None:
+        url = build_flash_attn(torch_req)
+        if url is None:
+            return None
+    return f"flash-attn @ {url}"
 
 
 def get_requirements():
-    info = probe_target_torch()
-    if info is not None:
-        print(
-            f"[kavor] 目标环境已有 torch {info['version']} / CUDA {info['cuda']} "
-            f"/ cxx11abi={info['abi']}"
-        )
+    variant, notes = resolve_variant(
+        nvcc_major(), driver_major(), os.environ.get("KAVOR_TORCH_CUDA", "auto")
+    )
+    for note in notes:
+        log(note)
 
-    torch_req, fa_info, variant = torch_requirement(info)
-    req = [torch_req] + list(BASE_REQUIREMENTS)
-
-    mode = os.environ.get("KAVOR_FLASH_ATTN", "auto").lower()
-    if mode == "skip":
-        print("[kavor] KAVOR_FLASH_ATTN=skip,不装 flash-attn")
-        return req
-
-    wheel = flash_attn_requirement(fa_info, variant)
-    if mode == "build":
-        print("[kavor] KAVOR_FLASH_ATTN=build,走源码编译")
-        req.append("flash-attn")
-    elif mode == "wheel":
-        if wheel is not None:
-            print(
-                "[kavor] KAVOR_FLASH_ATTN=wheel,"
-                f"使用预编译 wheel: {wheel.split(' @ ')[1]}"
-            )
-            req.append(wheel)
+    requirements = [f"torch=={TORCH_VERSION}", f"torchvision=={TORCHVISION_VERSION}"]
+    if variant is not None:
+        if PREBUILT_TORCH:
+            index = f"{PYTORCH_INDEX}/{variant}"
+            requirements = [
+                f"torch @ {index}/torch-{TORCH_VERSION}%2B{variant}{WHEEL_SUFFIX}",
+                f"torchvision @ {index}/torchvision-{TORCHVISION_VERSION}%2B{variant}"
+                f"{WHEEL_SUFFIX}",
+            ]
         else:
-            print("[kavor] KAVOR_FLASH_ATTN=wheel,但没有匹配到预编译 wheel。")
-    elif (local := probe_local_flash_attn()) is not None:
-        print(f"[kavor] 目标环境已有 flash-attn {local},跳过预编译 wheel 下载")
-        if local.split("+")[0] != FLASH_ATTN_VERSION:
-            print(
-                f"        预编译 wheel 的版本是 {FLASH_ATTN_VERSION},"
-                "如需换成它请设 KAVOR_FLASH_ATTN=wheel"
-            )
-        req.append("flash-attn")
-    elif wheel is not None:
-        print(f"[kavor] flash-attn 使用预编译 wheel: {wheel.split(' @ ')[1]}")
-        req.append(wheel)
-    else:
-        print("[kavor] 没匹配到预编译 wheel,本次不装 flash-attn。")
-        print("        自己编一个传上去,或设 KAVOR_FLASH_ATTN=build 走源码编译。")
-    return req
+            log("no prebuilt CUDA torch for this platform, falling back to the PyPI build")
+            variant = None
+    requirements += BASE_REQUIREMENTS
+
+    if INSTALL_FLASH_ATTN:
+        flash_attn = flash_attn_requirement(variant, requirements[0])
+        if flash_attn:
+            requirements.append(flash_attn)
+    return requirements
 
 
-setup(
-    install_requires=get_requirements(),
-    # Marlin 的 CUDA 源码随包分发,首次使用时 JIT 编译(见
-    # kavor/kernels/fp8/marlin_build.py)。kavor/csrc 不是 Python 包,
-    # 所以要在这里显式声明为 kavor 包的 data files。
-    package_data={
-        "kavor": [
-            "csrc/quantization/marlin/*.cu",
-            "csrc/quantization/marlin/*.cuh",
-            "csrc/quantization/marlin/*.h",
-            "csrc/quantization/marlin/*.py",
-            "csrc/quantization/marlin/*.md",
-            "csrc/quantization/marlin/LICENSE.vllm",
-            "csrc/quantization/marlin/NOTICE",
-        ],
-    },
-)
+setup(install_requires=get_requirements())

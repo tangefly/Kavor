@@ -14,10 +14,10 @@ Kavor 是一个轻量级推理框架：从零实现大模型推理的完整链�
 
 ## 环境要求
 
-- Linux x86_64
-- Python 3.10 – 3.12
-- NVIDIA GPU，CUDA 12.6 或 13.0
-- PyTorch 2.9.x（安装时按本机环境自动匹配）
+- Linux x86_64（aarch64 也可用，但 flash-attn 需要现场编译）
+- Python 3.10 – 3.13
+- NVIDIA GPU（compute capability 8.0 及以上）
+- PyTorch 2.14（安装时自动选择，见下文）
 
 ## 安装
 
@@ -35,12 +35,24 @@ cd Kavor
 pip install -e .
 ```
 
-安装脚本会探测本机 `nvcc` 版本，自动挑选匹配的 PyTorch 与预编译 `flash-attn` wheel，无需手工对齐版本。需要覆盖时可用环境变量：
+一条命令装齐全部依赖。构建阶段脚本会：
+
+1. 探测目标环境的 `torch`，并读取本机 `nvcc` 与驱动版本；
+2. 把 `torch` 固定为 2.14.1，并选对应的 CUDA 构建（`cu126` / `cu130`）——`nvcc` 优先，驱动版本作为硬上限；
+3. 安装 `flash-attn`：[Kavor release](https://github.com/tangefly/Kavor/releases) 上有可用的 wheel 就直接用；没有就在同一次执行里拉取 `v2.8.3.post2` 版本的 `flash-attention` 仓库现场编译（10–30 分钟，产物缓存在 `~/.cache/kavor/wheels`）。
+
+全新环境下脚本会先自己装好 `torch` 再编译，所以一条 `pip install -e .` 就够。
+
+```bash
+KAVOR_TORCH_CUDA=cu126 pip install -e .   # 强制指定 CUDA 构建(cu126 / cu130 / none)
+KAVOR_INSTALL_FLASH_ATTN=0 pip install -e .   # 不装 flash-attn(pip download、uv lock)
+```
 
 | 变量 | 取值 | 说明 |
 | --- | --- | --- |
-| `KAVOR_TORCH_CUDA` | `auto`（默认）/ `cu126` / `cu130` | 指定 PyTorch 的 CUDA 变体 |
-| `KAVOR_FLASH_ATTN` | `auto`（默认）/ `wheel` / `build` / `skip` | flash-attn 的获取方式：预编译 wheel、源码编译或跳过 |
+| `KAVOR_TORCH_CUDA` | `auto`（默认）/ `cu126` / `cu130` / `none` | 强制或跳过程序对 PyTorch CUDA 构建的选择 |
+| `KAVOR_INSTALL_FLASH_ATTN` | `1`（默认）/ `0` | 是否安装 `flash-attn` |
+| `KAVOR_WHEEL_CACHE` | 路径 | 现场编译产物的缓存目录（默认 `~/.cache/kavor/wheels`） |
 
 测试与压测依赖按需安装：
 

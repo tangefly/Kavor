@@ -10,14 +10,14 @@ license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.14"
 dynamic = ["dependencies"]
 
 [project.urls]
 Homepage="https://github.com/tangefly/Kavor"
 
 [project.optional-dependencies]
-serve = ["fastapi", "uvicorn"]
+serve = ["fastapi>=0.115", "uvicorn>=0.30", "pydantic>=2.6"]
 test = ["pytest"]
 bench = ["matplotlib"]
 
@@ -27,6 +27,18 @@ kavor = "kavor.interface.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["kavor*"]
+
+# marlin 的 CUDA 源码在运行时 JIT 编译,必须随包分发。
+[tool.setuptools.package-data]
+kavor = [
+    "csrc/quantization/marlin/*.cu",
+    "csrc/quantization/marlin/*.cuh",
+    "csrc/quantization/marlin/*.h",
+    "csrc/quantization/marlin/*.py",
+    "csrc/quantization/marlin/*.md",
+    "csrc/quantization/marlin/LICENSE.vllm",
+    "csrc/quantization/marlin/NOTICE",
+]
 
 [tool.ruff]
 line-length = 100

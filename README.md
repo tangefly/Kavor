@@ -14,10 +14,10 @@ Kavor is a lightweight inference framework: the entire LLM serving path — mode
 
 ## Requirements
 
-- Linux x86_64
-- Python 3.10 – 3.12
-- NVIDIA GPU with CUDA 12.6 or 13.0
-- PyTorch 2.9.x (matched automatically during installation)
+- Linux x86_64 (aarch64 works too, but needs a flash-attn source build)
+- Python 3.10 – 3.13
+- NVIDIA GPU (compute capability 8.0 or higher)
+- PyTorch 2.14 (selected automatically, see below)
 
 ## Installation
 
@@ -35,12 +35,24 @@ cd Kavor
 pip install -e .
 ```
 
-The install script detects your local `nvcc` version and picks a matching PyTorch build plus prebuilt `flash-attn` wheel, so versions line up without manual work. Override it with environment variables when needed:
+One command installs everything. During the build, the script:
+
+1. probes the target environment for `torch` and reads `nvcc` plus the driver version;
+2. pins `torch` to 2.14.1 with the matching CUDA build (`cu126` or `cu130`) — `nvcc` wins and the driver version is a hard upper bound;
+3. installs `flash-attn`: a usable wheel on the [Kavor release](https://github.com/tangefly/Kavor/releases) is used as is; otherwise the `flash-attention` repository at `v2.8.3.post2` is pulled and compiled in the same run (10–30 min, the wheel is cached in `~/.cache/kavor/wheels`).
+
+In a brand-new environment the script installs `torch` itself before compiling, so a single `pip install -e .` is enough.
+
+```bash
+KAVOR_TORCH_CUDA=cu126 pip install -e .   # force a CUDA build (cu126 / cu130 / none)
+KAVOR_INSTALL_FLASH_ATTN=0 pip install -e .   # leave flash-attn out (pip download, uv lock)
+```
 
 | Variable | Value | Description |
 | --- | --- | --- |
-| `KAVOR_TORCH_CUDA` | `auto` (default) / `cu126` / `cu130` | Force a specific PyTorch CUDA build |
-| `KAVOR_FLASH_ATTN` | `auto` (default) / `wheel` / `build` / `skip` | How to obtain flash-attn: prebuilt wheel, build from source, or skip |
+| `KAVOR_TORCH_CUDA` | `auto` (default) / `cu126` / `cu130` / `none` | Force or skip the PyTorch CUDA build selection |
+| `KAVOR_INSTALL_FLASH_ATTN` | `1` (default) / `0` | Whether `flash-attn` is installed |
+| `KAVOR_WHEEL_CACHE` | path | Where locally compiled wheels are cached (default `~/.cache/kavor/wheels`) |
 
 Test and benchmark dependencies are optional:
 
