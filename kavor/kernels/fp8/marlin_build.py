@@ -9,10 +9,25 @@ import torch
 from kavor.utils.logger import logger
 
 CSRC = Path(__file__).resolve().parents[2] / "csrc" / "quantization" / "marlin"
+REPO_ROOT = Path(__file__).resolve().parents[3]
 _EXT_PREFIX = "kavor_marlin"
 
 _ops = None
 _failure: Exception | None = None
+
+
+def _use_repo_cache() -> None:
+    """Keep the JIT build in the checkout's .cache (git-ignored) instead of ~/.cache.
+    """
+    if not (REPO_ROOT / "setup.py").is_file():
+        return
+    tag = getattr(sys, "abiflags", "")
+    cuda = (torch.version.cuda or "").replace(".", "")
+    cache = REPO_ROOT / ".cache" / "torch_extensions" / (
+        f"py{sys.version_info.major}{sys.version_info.minor}{tag}_cu{cuda}"
+    )
+    cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(cache))
 
 
 def is_disabled() -> bool:
@@ -74,6 +89,7 @@ def _extension_name() -> str:
 def _build() -> None:
     from torch.utils.cpp_extension import _get_build_directory, load
 
+    _use_repo_cache()
     name = _extension_name()
     build_dir = Path(_get_build_directory(name, verbose=False))
     build_dir.mkdir(parents=True, exist_ok=True)

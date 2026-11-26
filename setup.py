@@ -43,6 +43,7 @@ BASE_REQUIREMENTS = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "einops>=0.8",
+    "flashinfer-python==0.7.6",
     "flash-linear-attention[cuda]==0.6.0",
 ]
 
@@ -63,10 +64,15 @@ else:
                                "abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI)}}), flush=True)
 try:
     import flash_attn
+    from importlib.metadata import version as dist_version
+
+    # flash_attn.__version__ drops the local tag (cu13sm89sm90torch2.14cxx11abitrue), which is
+    # the part that says whether this build fits the installed torch.
+    installed_flash_attn = dist_version("flash_attn")
 except BaseException:
     pass
 else:
-    print(json.dumps({"flash_attn": flash_attn.__version__}), flush=True)
+    print(json.dumps({"flash_attn": installed_flash_attn}), flush=True)
 """
 GPU_PROBE = (
     "import json, torch; "
@@ -249,15 +255,16 @@ def release_wheel(cu_major, abi):
     try:
         with urllib.request.urlopen(KAVOR_RELEASES, timeout=30) as response:
             releases = json.load(response)
-        urls = [
-            asset["browser_download_url"]
-            for release in releases
-            for asset in release["assets"]
-        ]
+        assets = [asset for release in releases for asset in release["assets"]]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         log(f"could not list the wheels on the Kavor release ({exc})")
         return None
-    return next((url for url in urls if wheel_pattern(cu_major, abi).search(url)), None)
+    # Match the asset name, not its URL: the URL spells "+" as "%2B".
+    pattern = wheel_pattern(cu_major, abi)
+    return next(
+        (asset["browser_download_url"] for asset in assets if pattern.search(asset["name"])),
+        None,
+    )
 
 
 def cached_wheel(cu_major, abi):
@@ -280,14 +287,18 @@ def max_jobs():
     return max(1, min(os.cpu_count() or 4, int(available_gb // 9) or 1, 8))
 
 
-# flash-attn reads its own arch knob and ignores TORCH_CUDA_ARCH_LIST; it only knows
-# sm_80/90/100/120, and an sm_80 build runs on every 8.x card.
-CUDA_ARCHS = {"8": "80", "9": "90", "10": "100", "12": "120"}
+# flash-attn reads its own arch knob and ignores TORCH_CUDA_ARCH_LIST. One wheel for every
+# card we serve: Ada (89), Hopper (90), Blackwell (100, 120).
+CUDA_ARCHS = "89;90;100;120"
 
 
-def flash_attn_archs(capability):
-    """The flash-attn arch name for this GPU, or None to keep the upstream default."""
-    return CUDA_ARCHS.get((capability or "").split(".")[0])
+def flash_attn_archs():
+    """The archs to compile, ';' separated as flash-attn expects.
+
+    FLASH_ATTN_CUDA_ARCHS (flash-attn's own knob) wins over the default, e.g. "89;90" for a
+    shorter build.
+    """
+    return os.environ.get("FLASH_ATTN_CUDA_ARCHS") or CUDA_ARCHS
 
 
 def patch_cxx_std(src):
@@ -317,7 +328,6 @@ def compile_flash_attn(torch_req):
             "the build may fail"
         )
 
-    capability = probe_target(GPU_PROBE).get("capability")
     env = target_env(
         {
             "MAX_JOBS": str(max_jobs()),
@@ -329,9 +339,14 @@ def compile_flash_attn(torch_req):
             ),
         }
     )
-    archs = flash_attn_archs(capability)
-    if archs:
-        env["FLASH_ATTN_CUDA_ARCHS"] = archs
+    archs = flash_attn_archs()
+    env["FLASH_ATTN_CUDA_ARCHS"] = archs
+    # flash-attn only emits gencode for 80/90/100/120, so nvcc is asked for the rest.
+    extra = [arch for arch in archs.split(";") if arch not in ("80", "90", "100", "120")]
+    if extra:
+        env["NVCC_APPEND_FLAGS"] = " ".join(
+            f"-gencode arch=compute_{arch},code=sm_{arch}" for arch in extra
+        )
 
     dest = wheel_cache_dir()
     dest.mkdir(parents=True, exist_ok=True)
